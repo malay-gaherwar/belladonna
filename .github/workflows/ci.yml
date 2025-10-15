@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
   pull_request:
@@ -7,24 +6,48 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
+          # Use the same major Python you used locally. 3.11 is fine too.
           python-version: "3.11"
-      - name: Install dependencies
+          cache: "pip"
+
+      - name: Show Python info (debug)
+        run: |
+          python --version
+          pip --version
+          which python
+          python -c "import sys, platform; print(sys.executable); print(platform.platform())"
+
+      - name: Upgrade build tooling
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade setuptools wheel build
+
+      - name: Install package (editable) + dev tools
+        run: |
           pip install -e .
           pip install ruff mypy black pytest pytest-cov pre-commit
+
+      - name: Smoke import (early fail if packaging is broken)
+        run: python -c "import belladonna; print('hello ->', __import__('belladonna').hello())"
+
       - name: Lint
         run: |
+          ruff --version
           ruff check .
+          black --version
           black --check .
+
       - name: Type check
-        run: mypy src
+        run: mypy --version && mypy src
+
       - name: Tests
         run: pytest -q --cov=src
-      - name: Pre-commit
+
+      - name: Pre-commit (all files)
         run: pre-commit run --all-files
