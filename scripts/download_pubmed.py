@@ -1,11 +1,7 @@
-#!/usr/bin/env python3
-"""Minimal PubMed E-utilities example (ESearch -> EFetch stub).
-
-This is a placeholder; expand to your project's needs.
-"""
 import argparse
 import os
 from pathlib import Path
+from typing import Any, cast  # NEW
 
 import requests
 
@@ -20,11 +16,12 @@ def esearch(query: str, api_key: str | None, email: str | None) -> list[str]:
         params["email"] = email
     r = requests.get(f"{BASE}/esearch.fcgi", params=params, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    return data.get("esearchresult", {}).get("idlist", [])
+    data = cast(dict[str, Any], r.json())
+    ids = data.get("esearchresult", {}).get("idlist", [])
+    return cast(list[str], ids)  # ensure mypy knows this is list[str]
 
 
-def main():
+def main() -> None:  # add return type
     p = argparse.ArgumentParser()
     p.add_argument("--query", required=True, help="PubMed query string")
     p.add_argument("--out", default="artifacts/pubmed_ids.txt")
