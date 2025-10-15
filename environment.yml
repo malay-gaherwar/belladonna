@@ -1,0 +1,25 @@
+name: belladonna
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - ipykernel
+  - pydantic>=2
+  - pyyaml
+  - requests
+  - httpx
+  - pandas
+  - numpy
+  - tqdm
+  - beautifulsoup4
+  - lxml
+  - pytest
+  - pytest-cov
+  - mypy
+  - black
+  - pip:
+      - ruff
+      - pre-commit
+      - python-dotenv

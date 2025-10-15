@@ -1,0 +1,4 @@
+log_level: INFO
+data_dir: data
+# pubmed_email: you@example.edu
+# ncbi_api_key: ${NCBI_API_KEY}  # loaded from env

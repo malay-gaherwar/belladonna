@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/*.log
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Envs
+.env
+.venv/
+env/
+venv/
+
+# Data & models
+data/
+models/
+artifacts/
+
+# OS
+.DS_Store
+Thumbs.db
