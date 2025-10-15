@@ -33,3 +33,10 @@ extend-select = ["I"]
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
