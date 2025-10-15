@@ -3,9 +3,11 @@
 
 This is a placeholder; expand to your project's needs.
 """
-import argparse, os
-import requests
+import argparse
+import os
 from pathlib import Path
+
+import requests
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
