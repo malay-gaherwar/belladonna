@@ -1,18 +1,22 @@
 import argparse
 import json
-import sys
 
 from .config import AppConfig
 from .logging_config import configure_logging
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Belladonna CLI")
     parser.add_argument(
-        "--config", type=str, default="configs/default.yaml", help="Path to YAML config"
+        "--config",
+        type=str,
+        default="configs/default.yaml",
+        help="Path to YAML config",
     )
     parser.add_argument(
-        "--print-config", action="store_true", help="Print the resolved config and exit"
+        "--print-config",
+        action="store_true",
+        help="Print the resolved config and exit",
     )
     args = parser.parse_args()
 
@@ -21,7 +25,7 @@ def main():
 
     if args.print_config:
         print(json.dumps(cfg.model_dump(), indent=2))
-        sys.exit(0)
+        return  # keep function typed as -> None
 
     print("✅ Belladonna CLI ok. Edit src/belladonna/__main__.py to add commands.")
 
