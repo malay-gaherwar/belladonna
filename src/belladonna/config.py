@@ -1,7 +1,10 @@
 from __future__ import annotations
-from pydantic import BaseModel
-import yaml
+
 from typing import Optional
+
+import yaml
+from pydantic import BaseModel
+
 
 class AppConfig(BaseModel):
     log_level: str = "INFO"

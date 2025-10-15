@@ -3,11 +3,12 @@
 
 This is a placeholder; expand to your project's needs.
 """
-import argparse, os, time
+import argparse, os
 import requests
 from pathlib import Path
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
 
 def esearch(query: str, api_key: str | None, email: str | None) -> list[str]:
     params = {"db": "pubmed", "term": query, "retmode": "json"}
@@ -19,6 +20,7 @@ def esearch(query: str, api_key: str | None, email: str | None) -> list[str]:
     r.raise_for_status()
     data = r.json()
     return data.get("esearchresult", {}).get("idlist", [])
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -34,6 +36,7 @@ def main():
     with open(args.out, "w") as f:
         f.write("\n".join(ids))
     print(f"Saved {len(ids)} ids → {args.out}")
+
 
 if __name__ == "__main__":
     main()
