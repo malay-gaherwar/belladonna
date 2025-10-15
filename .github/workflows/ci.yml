@@ -31,7 +31,7 @@ jobs:
       - name: Install package (editable) + dev tools
         run: |
           pip install -e .
-          pip install ruff mypy black pytest pytest-cov pre-commit
+          pip install ruff mypy black pytest pytest-cov pre-commit types-PyYAML
 
       - name: Smoke import (early fail if packaging is broken)
         run: python -c "import belladonna; print('hello ->', __import__('belladonna').hello())"
