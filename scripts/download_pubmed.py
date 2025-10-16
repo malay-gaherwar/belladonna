@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 from typing import Any, cast
+
 import requests
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -33,12 +34,7 @@ def efetch(pmids: list[str]) -> list[str]:
     """Fetch article details (titles + abstracts) for given PMIDs."""
     if not pmids:
         return []
-    params = {
-        "db": "pubmed",
-        "id": ",".join(pmids),
-        "retmode": "text",
-        "rettype": "medline"
-    }
+    params = {"db": "pubmed", "id": ",".join(pmids), "retmode": "text", "rettype": "medline"}
     r = requests.get(f"{BASE}/efetch.fcgi", params=params, timeout=60)
     r.raise_for_status()
     return r.text.split("\n\n")  # crude split, enough for a small demo
