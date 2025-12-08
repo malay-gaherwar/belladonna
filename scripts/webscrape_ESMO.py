@@ -1,35 +1,18 @@
 #!/usr/bin/env python3
-"""
-Scrape the four main ESMO Breast Cancer guideline pages and save them as text.
-
-Usage:
-  pip install selenium
-  python scripts/webscrape_ESMO.py [--headful]
-
-Outputs:
-  artifacts/ESMO/<slug>.txt
-  artifacts/ESMO/debug_screenshot.png (only on failure)
-  artifacts/ESMO/debug_page.html (only on failure)
-"""
-
 from __future__ import annotations
-import argparse
-import pathlib
-import re
-import time
-from typing import List, Tuple
-from urllib.parse import urlparse
+import argparse, pathlib, re, time
+from typing import List, Tuple, Optional
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, JavascriptException
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from pdfminer.high_level import extract_text as pdf_extract_text
 
 START_URL = "https://www.esmo.org/guidelines/esmo-clinical-practice-guidelines-breast-cancer"
+
 OUT_DIR = pathlib.Path("artifacts/ESMO")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+PDF_DIR = OUT_DIR / "pdfs"
+TXT_DIR = OUT_DIR / "text"
+for d in (OUT_DIR, PDF_DIR, TXT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 TARGETS = [
     "Breast Cancer in Young Women",  # (BCY5)
@@ -38,78 +21,19 @@ TARGETS = [
     "Risk Reduction and Screening of Cancer in Hereditary Breast-Ovarian Cancer Syndromes",
 ]
 
-def make_driver(headless: bool = True) -> webdriver.Chrome:
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,1000")
-    opts.add_argument("--lang=en-US,en")
-    opts.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    # Be a bit more forgiving on JS-heavy pages
-    opts.page_load_strategy = "normal"
-    driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(90)
-    driver.implicitly_wait(1)
-    return driver
-
-def js_ready(driver) -> None:
-    """Wait until document.readyState == 'complete'."""
-    wait = WebDriverWait(driver, 30)
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-
-def polite_pause(sec: float = 1.2) -> None:
-    time.sleep(sec)
-
-def scroll_page(driver) -> None:
-    """Scroll to trigger lazy content."""
-    try:
-        height = driver.execute_script("return document.body.scrollHeight || 2000;")
-        step = max(400, int(height / 5))
-        pos = 0
-        while pos < height:
-            driver.execute_script(f"window.scrollTo(0, {pos});")
-            time.sleep(0.3)
-            pos += step
-        driver.execute_script("window.scrollTo(0, 0);")
-    except JavascriptException:
-        pass
-
-def click_cookie_banner_if_present(driver) -> None:
-    # Try a few common consent frameworks (OneTrust, custom, etc.)
-    possible = [
-        (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
-        (By.XPATH, "//button[normalize-space()='Accept All']"),
-        (By.XPATH, "//button[contains(translate(., 'ACEPTILGR', 'aceptilgr'), 'accept')]"),
-        (By.XPATH, "//button[contains(., 'I agree')]"),
-        (By.XPATH, "//button[contains(., 'Accept')]"),
-    ]
-    for how, sel in possible:
-        try:
-            btn = WebDriverWait(driver, 4).until(EC.element_to_be_clickable((how, sel)))
-            btn.click()
-            time.sleep(0.5)
-            return
-        except Exception:
-            continue
-
-def visible_text(el) -> str:
-    return re.sub(r"[ \t]+\n", "\n", el.text.strip())
-
 def sanitize_filename(name: str) -> str:
     name = name.strip().lower()
     name = re.sub(r"[^a-z0-9._-]+", "-", name)
     name = re.sub(r"-{2,}", "-", name).strip("-")
     return name or "esmo-guideline"
 
-def find_target_links(driver) -> List[Tuple[str, str]]:
-    """Find links by scanning anchors; do not rely on <main> availability."""
-    anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+def visible_text(el) -> str:
+    txt = el.inner_text().strip()
+    txt = re.sub(r"[ \t]+\n", "\n", txt)
+    return txt
+
+def find_target_links_on_esmo_index(page) -> List[Tuple[str, str]]:
+    anchors = page.query_selector_all("a[href]")
     found: List[Tuple[str, str]] = []
     for a in anchors:
         href = a.get_attribute("href") or ""
@@ -123,8 +47,7 @@ def find_target_links(driver) -> List[Tuple[str, str]]:
             if t.lower() in tl:
                 found.append((t, href))
                 break
-
-    # Deduplicate by target text
+    # dedupe by target text
     unique, seen = [], set()
     for t, href in found:
         if t not in seen:
@@ -132,101 +55,170 @@ def find_target_links(driver) -> List[Tuple[str, str]]:
             seen.add(t)
     return unique
 
-def extract_page_text(driver, url: str) -> Tuple[str, str]:
-    driver.get(url)
-    js_ready(driver)
-    polite_pause(1.0)
-    click_cookie_banner_if_present(driver)
-    scroll_page(driver)
-    polite_pause(0.6)
-
-    # Title
-    title_text = ""
-    for sel in ["main h1", "article h1", "header h1", "h1"]:
-        try:
-            h1 = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-            if h1.text.strip():
-                title_text = h1.text.strip()
-                break
-        except Exception:
-            pass
-    if not title_text:
-        title_text = url
-
-    # Body
-    body_text = ""
-    for sel in ["main article", "main .rich-text", "article", "main", "body"]:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            txt = visible_text(el)
-            if len(txt.split()) > 50:
-                body_text = txt
-                break
-        except Exception:
+def find_pdf_anchor_on_esmo_page(page):
+    anchors = page.query_selector_all("a[href]")
+    best_el, best_href = None, None
+    for a in anchors:
+        href = (a.get_attribute("href") or "").strip()
+        txt = visible_text(a).lower()
+        if not href:
             continue
-    if not body_text:
-        body_text = visible_text(driver.find_element(By.TAG_NAME, "body"))
-    return title_text, body_text
+        if "annalsofoncology.org" in href and ("showpdf" in href or "pii=" in href):
+            best_el, best_href = a, href
+            if "pdf" in txt or "view the pdf" in txt:
+                return best_el, best_href
+    return best_el, best_href
 
-def dump_debug(driver, name_prefix: str = "debug") -> None:
-    try:
-        png_path = OUT_DIR / f"{name_prefix}_screenshot.png"
-        html_path = OUT_DIR / f"{name_prefix}_page.html"
-        driver.save_screenshot(str(png_path))
-        html = driver.page_source
-        html_path.write_text(html, encoding="utf-8")
-        print(f"[debug] Wrote {png_path} and {html_path}")
-    except Exception:
-        pass
+def extract_text_from_pdf_file(pdf_path: pathlib.Path) -> str:
+    text = pdf_extract_text(str(pdf_path))
+    text = re.sub(r"\s+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--headful", action="store_true", help="Run with a visible browser.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--headful", action="store_true", help="Show browser (recommended for first run).")
+    ap.add_argument("--profile-dir", default=".pw_esmo_profile", help="Persistent user data dir to keep cookies.")
+    args = ap.parse_args()
 
-    driver = make_driver(headless=not args.headful)
-    try:
-        driver.get(START_URL)
-        js_ready(driver)
-        polite_pause(0.8)
-        click_cookie_banner_if_present(driver)
-        scroll_page(driver)
-        polite_pause(0.8)
+    user_data_dir = pathlib.Path(args.profile_dir)
+    user_data_dir.mkdir(exist_ok=True)
 
-        links = find_target_links(driver)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=not args.headful,
+            viewport={"width": 1400, "height": 1100},
+            locale="en-US",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            accept_downloads=True,
+        )
+        page = browser.new_page()
 
-        # Retry once after a small wait if we didn't catch them first time
+        # 1) Index
+        page.goto(START_URL, wait_until="domcontentloaded", timeout=90000)
+        # try dismiss cookie banners
+        for sel in [
+            "button#onetrust-accept-btn-handler",
+            "text='Accept All'",
+            "button:has-text('Accept')",
+        ]:
+            try:
+                page.locator(sel).first.click(timeout=2000)
+                break
+            except Exception:
+                pass
+
+        # gentle scroll to trigger lazy content
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(600)
+        page.evaluate("window.scrollTo(0, 0)")
+        links = find_target_links_on_esmo_index(page)
         if len(links) < 4:
-            polite_pause(1.5)
-            scroll_page(driver)
-            links = find_target_links(driver)
+            page.wait_for_timeout(1500)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(800)
+            page.evaluate("window.scrollTo(0, 0)")
+            links = find_target_links_on_esmo_index(page)
 
         missing = [t for t in TARGETS if t not in [x[0] for x in links]]
         if missing:
-            dump_debug(driver, "index")
-            raise RuntimeError(f"Did not find all expected links. Missing: {missing}\nFound: {links}")
+            browser.close()
+            raise SystemExit(f"Missing expected links on index: {missing}\nFound: {links}")
 
-        print("Found links:")
+        print("Found ESMO pages:")
         for t, href in links:
             print(f"- {t} -> {href}")
 
-        for t, href in links:
-            print(f"\nScraping: {t}")
-            try:
-                title, text = extract_page_text(driver, href)
-            except TimeoutException:
-                dump_debug(driver, sanitize_filename(t))
-                raise
+        # 2) Each guideline page => click "View the PDF" => expect_download
+        for t, esmo_url in links:
+            print(f"\nOpening ESMO page for: {t}")
+            page.goto(esmo_url, wait_until="domcontentloaded", timeout=90000)
+            # cookie again if needed
+            for sel in [
+                "button#onetrust-accept-btn-handler",
+                "text='Accept All'",
+                "button:has-text('Accept')",
+            ]:
+                try:
+                    page.locator(sel).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
 
-            fname = sanitize_filename(title)
-            out_path = OUT_DIR / f"{fname}.txt"
-            header = f"{title}\nSOURCE: {href}\n\n"
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(header + text)
-            print(f"Saved: {out_path}")
-            polite_pause(1.0)  # be polite
-    finally:
-        driver.quit()
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(500)
+            page.evaluate("window.scrollTo(0, 0)")
+
+            pdf_el, pdf_url = find_pdf_anchor_on_esmo_page(page)
+            if not pdf_el or not pdf_url:
+                page.screenshot(path=str(OUT_DIR / (sanitize_filename(t) + "_esmo.png")))
+                (OUT_DIR / (sanitize_filename(t) + "_esmo.html")).write_text(page.content(), encoding="utf-8")
+                raise SystemExit(f"No PDF link found on ESMO page for: {t}")
+            print(f"  PDF: {pdf_url}")
+
+            # use page title for filenames
+            title = ""
+            for sel in ["main h1", "article h1", "header h1", "h1", "title"]:
+                try:
+                    title = page.locator(sel).first.inner_text(timeout=1500).strip()
+                    if title:
+                        break
+                except Exception:
+                    pass
+            base = sanitize_filename(title or t)
+            target_pdf = PDF_DIR / f"{base}.pdf"
+            target_txt = TXT_DIR / f"{base}.txt"
+
+            # Expect a download; click the link
+            try:
+                with page.expect_download(timeout=120000) as dl_info:
+                    pdf_el.click()
+                download = dl_info.value
+                # sometimes filename has query bits; we normalize
+                temp_path = download.path()
+                if temp_path:
+                    pathlib.Path(temp_path).replace(target_pdf)
+                else:
+                    # if Playwright kept it in memory, explicitly save
+                    download.save_as(str(target_pdf))
+                print(f"  Saved PDF: {target_pdf}")
+            except PWTimeout:
+                # If it opened in a new tab showing the PDF inline:
+                # grab that page and ask it to save via download attribute
+                print("  [warn] No download event; trying new-page fallback …")
+                pages = browser.pages
+                if len(pages) > 1:
+                    pdf_page = pages[-1]
+                    # Try to trigger download via location
+                    try:
+                        with pdf_page.expect_download(timeout=120000) as dl_info:
+                            pdf_page.evaluate("() => window.print()")  # often triggers PDF save dialog; Playwright captures
+                        download = dl_info.value
+                        tmp = download.path()
+                        if tmp:
+                            pathlib.Path(tmp).replace(target_pdf)
+                        else:
+                            download.save_as(str(target_pdf))
+                        print(f"  Saved PDF (fallback): {target_pdf}")
+                    except Exception:
+                        pdf_page.screenshot(path=str(OUT_DIR / (base + "_pdfpage.png")))
+                        (OUT_DIR / (base + "_pdfpage.html")).write_text(pdf_page.content(), encoding="utf-8")
+                        raise SystemExit("Could not capture a download from the PDF page.")
+                else:
+                    page.screenshot(path=str(OUT_DIR / (base + "_nodl.png")))
+                    (OUT_DIR / (base + "_nodl.html")).write_text(page.content(), encoding="utf-8")
+                    raise SystemExit("No download event and no PDF page detected.")
+
+            # Extract text
+            text = extract_text_from_pdf_file(target_pdf)
+            header = f"{title or t}\nSOURCE (PDF): {pdf_url}\nSAVED_PDF: {target_pdf}\n\n"
+            target_txt.write_text(header + text, encoding="utf-8")
+            print(f"  Extracted text: {target_txt}")
+
+        browser.close()
+        print("\nDone.")
 
 if __name__ == "__main__":
     main()

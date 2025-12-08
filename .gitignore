@@ -33,3 +33,7 @@ artifacts/
 # OS
 .DS_Store
 Thumbs.db
+
+logs/
+*.tar.gz
+elsevier_10.1016_j.annonc.2022.07.007.txt
