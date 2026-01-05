@@ -164,6 +164,14 @@ def save_text(outdir: Path, pmcid: str, header_meta: Mapping[str, str], content:
 
     return path
 
+def save_raw_xml(outdir: Path, pmcid: str, xml_bytes: bytes) -> Path:
+    xml_dir = outdir / "xml"
+    xml_dir.mkdir(parents=True, exist_ok=True)
+    path = xml_dir / f"{pmcid}.xml"
+    with path.open("wb") as f:
+        f.write(xml_bytes)
+    return path
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Download OA full text from Europe PMC to .txt")
@@ -187,6 +195,9 @@ def main() -> None:
             continue
         try:
             xml_bytes = fetch_fulltext_xml(a.pmcid)
+            raw_xml_path = save_raw_xml(outdir, a.pmcid, xml_bytes)
+            print(f"Saved raw XML: {raw_xml_path}")
+
             plain = jats_xml_to_text(xml_bytes)
             meta = {
                 "TITLE": a.title,

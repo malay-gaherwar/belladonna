@@ -9,8 +9,8 @@ from openai import OpenAI
 CONFIG = {
     "API": {
         "BASE_URL": "http://192.168.33.27/v1/",
-        "API_KEY": "VIRTUAL_API_KEY",
-        "Model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+        "API_KEY": os.environ.get("VIRTUAL_API_KEY"),
+        "Model": "Qwen3-Embedding-8B",
     },
     "GENERATION": {
         "temperature": 1.0,
@@ -102,7 +102,7 @@ Here is the input content:
 # --------------------------
 
 client = OpenAI(
-    api_key=os.getenv(CONFIG["API"]["API_KEY"]),
+    api_key=CONFIG["API"]["API_KEY"],
     base_url=CONFIG["API"]["BASE_URL"],
 )
 

@@ -11,7 +11,7 @@ from typing import Dict, List
 import chromadb
 from chromadb.utils import embedding_functions
 
-from factoid_utils import FactoidRecord, load_all_factoids
+from factoids_utils import FactoidRecord, load_all_factoids
 
 
 def build_chroma_collection(
@@ -48,14 +48,14 @@ def build_chroma_collection(
         end = start + batch_size
         batch = records[start:end]
         collection.add(
-            ids=[r.factoid_id for r in batch],
+            ids=[str(r.factoid_id) for r in batch],
             documents=[r.text for r in batch],
             metadatas=[
                 {
-                    "article_id": r.article_id,
-                    "source": r.source,
+                    "pmid": r.pmid,
                     "index": r.index,
                     "doi": r.doi,
+                    # no "source" here anymore
                 }
                 for r in batch
             ],
@@ -81,11 +81,14 @@ def dedupe_factoids(
     # Chroma returns *distance*; default distance is cosine distance ~ (1 - cosine_sim)
     max_distance = 1.0 - similarity_threshold
 
-    id_to_record: Dict[str, FactoidRecord] = {r.factoid_id: r for r in records}
-    canonical_for: Dict[str, str] = {}  # factoid_id -> canonical_factoid_id
+    # Key everything by string factoid_id, because Chroma ids are strings
+    id_to_record: Dict[str, FactoidRecord] = {
+        str(r.factoid_id): r for r in records
+    }
+    canonical_for: Dict[str, str] = {}  # factoid_id(str) -> canonical_factoid_id(str)
 
     for r in records:
-        fid = r.factoid_id
+        fid = str(r.factoid_id)
         if fid in canonical_for:
             # already assigned as duplicate of an earlier canonical
             continue
@@ -103,6 +106,7 @@ def dedupe_factoids(
         distances = res["distances"][0]
 
         for nid, dist in zip(neighbour_ids, distances):
+            # All ids from Chroma are strings
             if nid == fid:
                 continue
             if dist is None:
@@ -121,7 +125,7 @@ def dedupe_factoids(
         groups[root].append(fid)
 
     # Build deduplicated record list: keep one per group (the canonical)
-    dedup_records = []
+    dedup_records: List[FactoidRecord] = []
     for canonical_id, fids in groups.items():
         # we keep the canonical record
         dedup_records.append(id_to_record[canonical_id])
@@ -163,6 +167,12 @@ def main():
         default=Path("artifacts/factoids_dedup.jsonl"),
         help="Where to write the deduplicated factoids (JSONL).",
     )
+    parser.add_argument(
+        "--duplicates-jsonl",
+        type=Path,
+        default=Path("artifacts/factoid_duplicates.jsonl"),
+        help="Where to write all duplicate clusters (JSONL).",
+    )
 
     args = parser.parse_args()
 
@@ -191,35 +201,71 @@ def main():
 
     print(f"Total factoids BEFORE dedup: {total_before}")
     print(f"Total factoids AFTER  dedup: {total_after}")
-    print(f"Reduction: {total_before - total_after} factoids "
-          f"({(1 - total_after / total_before) * 100:.2f}% fewer)")
+    print(
+        f"Reduction: {total_before - total_after} factoids "
+        f"({(1 - total_after / total_before) * 100:.2f}% fewer)"
+    )
 
-    # Optionally show a few clusters with >1 member for sanity check
+    # --- PRINT ALL DUPLICATES SO YOU CAN SEE WHAT WAS REMOVED ---
     multi_groups = [g for g in groups.values() if len(g) > 1]
     print(f"Found {len(multi_groups)} duplicate clusters (size >= 2).")
-    if multi_groups:
-        print("Example cluster (first one):")
-        example = multi_groups[0]
-        for fid in example:
-            r = next(x for x in records if x.factoid_id == fid)
-            print(f"- {fid}: {r.text[:120]}...")
 
-    # Write deduplicated factoids to a JSONL file for downstream steps
+    if multi_groups:
+        print("\n=== FULL LIST OF DUPLICATE CLUSTERS ===")
+        for cluster_idx, fids in enumerate(multi_groups, start=1):
+            canonical_id = fids[0]
+            canonical_record = next(
+                x for x in records if str(x.factoid_id) == canonical_id
+            )
+            print(f"\n[Cluster {cluster_idx}] Canonical factoid_id={canonical_record.factoid_id}")
+            print(f"  CANONICAL: {canonical_record.text}")
+            for fid in fids[1:]:
+                r = next(x for x in records if str(x.factoid_id) == fid)
+                print(f"  DUPLICATE (factoid_id={r.factoid_id}): {r.text}")
+
+    # --- ALSO SAVE DUPLICATE CLUSTERS TO JSONL FOR LATER INSPECTION ---
+    args.duplicates_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with args.duplicates_jsonl.open("w") as dup_f:
+        for fids in multi_groups:
+            canonical_id = fids[0]
+            canonical_record = next(
+                x for x in records if str(x.factoid_id) == canonical_id
+            )
+            cluster_obj = {
+                "canonical_factoid_id": canonical_record.factoid_id,
+                "canonical_text": canonical_record.text,
+                "duplicates": [],
+            }
+            for fid in fids[1:]:
+                r = next(x for x in records if str(x.factoid_id) == fid)
+                cluster_obj["duplicates"].append(
+                    {
+                        "factoid_id": r.factoid_id,
+                        "pmid": r.pmid,
+                        "doi": r.doi,
+                        "index": r.index,
+                        "text": r.text,
+                    }
+                )
+            dup_f.write(json.dumps(cluster_obj) + "\n")
+
+    print(f"\nWrote duplicate clusters to {args.duplicates_jsonl}")
+
+    # --- Write deduplicated factoids to JSONL ---
     args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with args.out_jsonl.open("w") as f:
         for r in dedup_records:
             f.write(
                 json.dumps(
                     {
-                        "factoid_id": r.factoid_id,
-                        "article_id": r.article_id,
+                        "factoid_id": r.factoid_id,  # numeric global id
+                        "pmid": r.pmid,
                         "doi": r.doi,
                         "pmcid": r.pmcid,
                         "title": r.title,
                         "journal": r.journal,
                         "year": r.year,
                         "index": r.index,
-                        "source": r.source,
                         "text": r.text,
                     }
                 )

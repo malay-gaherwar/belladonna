@@ -1,7 +1,7 @@
 # scripts/factoids_utils.py
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Iterable
 
@@ -11,17 +11,22 @@ class FactoidRecord:
     """
     One factoid with minimal but useful metadata for dedup / graph work.
     """
-    factoid_id: str          # unique internal id we construct
-    article_id: str          # e.g. MED:40220452
-    doi: Optional[str]
+
+    # Article-level fields
+    doi: str
     pmcid: Optional[str]
+    pmid: Optional[str]
     title: Optional[str]
     journal: Optional[str]
     year: Optional[int]
 
+    # Factoid-level fields
     index: int               # 'index' field from factoids array
-    source: Optional[str]    # usually DOI
     text: str                # factoid text
+
+    # Global factoid id (1..N), assigned later in load_all_factoids
+    factoid_id: int = field(default=0)
+
 
     @classmethod
     def from_json(
@@ -32,22 +37,14 @@ class FactoidRecord:
         """
         Build a FactoidRecord from metadata + one factoid dict.
         """
-        doi = meta.get("DOI") or factoid.get("source")
+        # Prefer DOI from metadata; fall back to factoid["source"],
+        # then to pmid, finally to a dummy string.
+        pmid = meta.get("ID") or "UNKNOWN_ARTICLE"
+        doi = meta.get("DOI") or factoid.get("source") or pmid or "UNKNOWN_DOI"
         pmcid = meta.get("PMCID")
-        article_id = meta.get("ID") or pmcid or doi or "UNKNOWN_ARTICLE"
-
-        # fall back to DOI if factoid.source is missing
-        source = factoid.get("source") or doi
 
         # factoid 'index' from your JSON (1,2,3,...)
         idx = factoid.get("index") or factoid.get("id") or 0
-
-        # build a stable id (safe for future graph DB use)
-        if doi:
-            safe_doi = doi.replace("/", "_")
-            factoid_id = f"doi:{safe_doi}::f{idx}"
-        else:
-            factoid_id = f"{article_id}::f{idx}"
 
         # year
         year = None
@@ -62,16 +59,15 @@ class FactoidRecord:
             raise ValueError("Empty factoid text encountered")
 
         return cls(
-            factoid_id=factoid_id,
-            article_id=article_id,
             doi=doi,
             pmcid=pmcid,
+            pmid=pmid,
             title=meta.get("TITLE"),
             journal=meta.get("JOURNAL"),
             year=year,
             index=int(idx),
-            source=source,
-            text=text,
+            text=text,      
+            factoid_id=0,      # factoid_id will be filled in later
         )
 
 
@@ -101,6 +97,10 @@ def iter_factoid_files(factoid_dir: Path) -> Iterable[FactoidRecord]:
 
 def load_all_factoids(factoid_dir: Path) -> List[FactoidRecord]:
     """
-    Convenience function: load everything into a list.
+    Convenience function: load everything into a list and assign
+    global numeric factoid_id from 1..N.
     """
-    return list(iter_factoid_files(factoid_dir))
+    records = list(iter_factoid_files(factoid_dir))
+    for i, r in enumerate(records, start=1):
+        r.factoid_id = i
+    return records
