@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.build/
+dist/
+scripts/test.py
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/*.log
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+
+
+# Data & models
+artifacts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+logs/
+*.tar.gz
+elsevier_10.1016_j.annonc.2022.07.007.txt
+
+.vscode/

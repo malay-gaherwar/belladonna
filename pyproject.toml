@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "belladonna"
+version = "0.1.0"
+description = "Breast-cancer knowledge aggregation and LLM benchmark"
+authors = [{ name="Belladonna Team"}]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "PyYAML",
+    "requests",
+    "httpx",
+    "pandas",
+    "numpy",
+    "tqdm",
+    "beautifulsoup4",
+    "lxml",
+    "python-dotenv"
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
