@@ -8,7 +8,7 @@ from openai import OpenAI
 
 CONFIG = {
     "API": {
-        "BASE_URL": "http://192.168.33.27/v1/",
+        "BASE_URL": os.environ.get("BASE_URL"),
         "API_KEY": os.environ.get("VIRTUAL_API_KEY"),
         "Model": "Qwen3-Embedding-8B",
     },

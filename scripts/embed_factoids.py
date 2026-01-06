@@ -14,7 +14,7 @@ import os
 
 CONFIG = {
     "API": {
-        "BASE_URL": "http://192.168.33.27/v1/",
+        "BASE_URL": os.environ.get("BASE_URL"),
         "API_KEY": os.environ.get("VIRTUAL_API_KEY"),
         "Model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
     },
