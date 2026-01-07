@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-Download OA full text from Europe PMC and save as .txt files.
+Download full text from Europe PMC (OA subset) using cursorMark deep paging
+and save both raw JATS XML and extracted plain text.
 
-- Uses /search for discovery (JSON).
-- Uses /{PMCID}/fullTextXML for OA full text.
-- Extracts title, abstract(s), and body text from JATS XML.
-- Skips figures, tables, and reference lists for a cleaner plain text.
+Key features:
+- Uses /search with cursorMark to iterate beyond 1000 results.
+- Downloads full text via /{PMCID}/fullTextXML (works for OA/PMCID items).
+- Saves:
+    artifacts/epmc_fulltext/PMCxxxxxxx.txt
+    artifacts/epmc_fulltext/xml/PMCxxxxxxx.xml
+- Prints real-time progress: how many records streamed and how many full texts downloaded.
+- Creates logs/ and writes a timestamped log file named after this script.
 
-Example:
+Examples:
     python scripts/epmc_fulltext.py
-    python scripts/epmc_fulltext.py --query "triple-negative breast cancer" --limit 10 --outdir artifacts/epmc_fulltext
+    python scripts/epmc_fulltext.py --query '("breast cancer") AND OPEN_ACCESS:Y'
+    python scripts/epmc_fulltext.py --query '("breast cancer") AND OPEN_ACCESS:Y' --outdir artifacts/epmc_fulltext --page-size 1000
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import json
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence, Union, cast
+from typing import Any, Iterator, Mapping, Sequence, Union, cast
 
 import requests
 import xml.etree.ElementTree as ET
+
 
 # ---- Requests typing helpers (keeps mypy happy) ----
 ParamScalar = Union[str, bytes, int, float]
@@ -61,23 +70,74 @@ class Article:
         )
 
 
-def epmc_search(query: str, limit: int) -> list[Article]:
+def make_logger(script_path: str | None) -> tuple[Path, callable]:
+    """
+    Create logs/ and a log file named: <script_stem>_YYYYmmdd_HHMMSS.log
+    Returns (log_path, log_fn).
+    """
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = Path(script_path).stem if script_path else "epmc_fulltext"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"{stem}_{ts}.log"
+
+    def log(msg: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    return log_path, log
+
+
+def epmc_search_page(query: str, page_size: int, cursor_mark: str, session: requests.Session) -> tuple[list[Article], str]:
+    """
+    Fetch one page using cursorMark deep paging.
+    Returns (articles, next_cursor_mark).
+    """
     params: Params = {
         "query": query,
         "format": "json",
-        "pageSize": limit,
+        "pageSize": page_size,
         "resultType": "lite",
+        "cursorMark": cursor_mark,
     }
-    r = requests.get(SEARCH_BASE, params=params, timeout=30)
+    r = session.get(SEARCH_BASE, params=params, timeout=30)
     r.raise_for_status()
+
     data = cast(dict[str, Any], r.json())
     results = cast(list[dict[str, Any]], (data.get("resultList") or {}).get("result", []) or [])
-    return [Article.from_epmc(x) for x in results[:limit]]
+    next_cursor = cast(str, data.get("nextCursorMark", ""))
+
+    return [Article.from_epmc(x) for x in results], next_cursor
 
 
-def fetch_fulltext_xml(pmcid: str) -> bytes:
+def iter_epmc_all(query: str, page_size: int, sleep_s: float, session: requests.Session) -> Iterator[Article]:
+    """
+    Stream all results for a query using cursorMark deep paging.
+    Stops when cursor stops advancing.
+    """
+    cursor = "*"
+    while True:
+        page, next_cursor = epmc_search_page(query=query, page_size=page_size, cursor_mark=cursor, session=session)
+        if not page:
+            return
+
+        for art in page:
+            yield art
+
+        if not next_cursor or next_cursor == cursor:
+            return
+
+        cursor = next_cursor
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+
+def fetch_fulltext_xml(pmcid: str, session: requests.Session) -> bytes:
     url = FULLTEXT_BASE.format(pmcid=pmcid)
-    r = requests.get(url, timeout=60)
+    r = session.get(url, timeout=60)
     r.raise_for_status()
     return r.content
 
@@ -98,45 +158,39 @@ def _findall_anyns(root: ET.Element, tag: str) -> list[ET.Element]:
 
 
 def jats_xml_to_text(xml_bytes: bytes) -> str:
-    # Parse XML
     root = ET.fromstring(xml_bytes)
 
     # Title
     titles = _findall_anyns(root, "article-title")
     title = _itertext(titles[0]) if titles else ""
 
-    # Abstract(s): JATS allows multiple
+    # Abstract(s)
     abstracts = _findall_anyns(root, "abstract")
     abstract_txt = "\n\n".join(_itertext(a) for a in abstracts) if abstracts else ""
 
-    # Body: exclude figures, tables, ref-lists, supplementary material
+    # Body: exclude some noisy blocks by clearing their content
     body_elems = _findall_anyns(root, "body")
     body_txt_parts: list[str] = []
+
     for body in body_elems:
-        # Remove unwanted sections in-place on a copy-like traversal
         for unwanted in ("fig", "table-wrap", "ref-list", "alternatives", "supplementary-material"):
             for node in list(body.findall(f".//{{*}}{unwanted}")):
-                parent = node.find("..")  # xml.etree doesn't support parent; so just clear content
                 node.clear()
 
-        # Collect section titles + paragraphs
         secs = body.findall(".//{*}sec")
         if secs:
             for sec in secs:
                 stitles = _findall_anyns(sec, "title")
                 if stitles:
                     body_txt_parts.append(_itertext(stitles[0]))
-                # Capture paragraphs in this section
                 for p in sec.findall(".//{*}p"):
                     body_txt_parts.append(_itertext(p))
         else:
-            # Fallback: just grab all paragraphs under body
             for p in body.findall(".//{*}p"):
                 body_txt_parts.append(_itertext(p))
 
     body_txt = "\n\n".join(x for x in body_txt_parts if x)
 
-    # Build final plain text
     blocks: list[str] = []
     if title:
         blocks.append(title)
@@ -164,6 +218,7 @@ def save_text(outdir: Path, pmcid: str, header_meta: Mapping[str, str], content:
 
     return path
 
+
 def save_raw_xml(outdir: Path, pmcid: str, xml_bytes: bytes) -> Path:
     xml_dir = outdir / "xml"
     xml_dir.mkdir(parents=True, exist_ok=True)
@@ -173,30 +228,102 @@ def save_raw_xml(outdir: Path, pmcid: str, xml_bytes: bytes) -> Path:
     return path
 
 
+def already_downloaded(outdir: Path, pmcid: str) -> bool:
+    """
+    Skip re-downloading if both XML and TXT already exist.
+    """
+    txt_path = outdir / f"{pmcid}.txt"
+    xml_path = outdir / "xml" / f"{pmcid}.xml"
+    return txt_path.exists() and xml_path.exists()
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Download OA full text from Europe PMC to .txt")
-    ap.add_argument("--query", default="breast cancer", help="Europe PMC query string.")
-    ap.add_argument("--limit", type=int, default=1000, help="Number of search results to consider.")
+    ap = argparse.ArgumentParser(description="Download Europe PMC full texts using cursorMark deep paging.")
+    ap.add_argument(
+        "--query",
+        default='("breast cancer") AND OPEN_ACCESS:Y',
+        help="Europe PMC query string. Recommended for bulk full-text: add OPEN_ACCESS:Y",
+    )
     ap.add_argument(
         "--outdir",
         default="artifacts/epmc_fulltext",
-        help="Output directory for .txt files.",
+        help="Output directory for .txt and raw XML files.",
+    )
+    ap.add_argument(
+        "--page-size",
+        type=int,
+        default=1000,
+        help="Search page size for cursorMark paging (use 1000 unless you have a reason).",
+    )
+    ap.add_argument(
+        "--sleep",
+        type=float,
+        default=0.1,
+        help="Sleep seconds between search pages (politeness / rate limiting).",
+    )
+    ap.add_argument(
+        "--max-downloads",
+        type=int,
+        default=0,
+        help="Safety cap: stop after downloading N full texts. 0 means no cap.",
+    )
+    ap.add_argument(
+        "--manifest",
+        default="artifacts/epmc_manifest.jsonl",
+        help="JSONL file to append every streamed record (metadata).",
     )
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
+    manifest_path = Path(args.manifest)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    arts = epmc_search(args.query, args.limit)
-    saved: list[Path] = []
+    log_path, log = make_logger(__file__ if "__file__" in globals() else None)
+    log(f"Log file: {log_path}")
+    log(f"Query: {args.query}")
+    log(f"Outdir: {outdir}")
+    log(f"Page size: {args.page_size}")
+    log(f"Sleep: {args.sleep}s")
+    if args.max_downloads:
+        log(f"Max downloads: {args.max_downloads}")
 
-    for a in arts:
-        if not (a.is_open_access and a.pmcid):
-            # Skip non-OA or items without PMCID
-            continue
+    session = requests.Session()
+
+    streamed = 0
+    downloaded = 0
+    skipped_no_pmcid_or_not_oa = 0
+    skipped_already = 0
+    http_errors = 0
+    other_errors = 0
+
+    # Stream all records
+    for a in iter_epmc_all(args.query, page_size=args.page_size, sleep_s=args.sleep, session=session):
+        streamed += 1
+
+        # Write every record to a JSONL manifest (so you always have the full set of IDs/metadata)
         try:
-            xml_bytes = fetch_fulltext_xml(a.pmcid)
+            with manifest_path.open("a", encoding="utf-8") as mf:
+                mf.write(json.dumps(a.__dict__, ensure_ascii=False) + "\n")
+        except Exception as e:  # noqa: BLE001
+            log(f"Manifest write failed (continuing): {e}")
+
+        # Real-time progress (streamed count updates constantly)
+        if streamed % 100 == 0:
+            log(f"Progress: streamed={streamed:,} | downloaded={downloaded:,} | skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} | skipped(already)={skipped_already:,}")
+
+        # Only downloadable XML via this endpoint requires OA + PMCID
+        if not (a.is_open_access and a.pmcid):
+            skipped_no_pmcid_or_not_oa += 1
+            continue
+
+        if already_downloaded(outdir, a.pmcid):
+            skipped_already += 1
+            continue
+
+        # Download full text
+        try:
+            xml_bytes = fetch_fulltext_xml(a.pmcid, session=session)
             raw_xml_path = save_raw_xml(outdir, a.pmcid, xml_bytes)
-            print(f"Saved raw XML: {raw_xml_path}")
 
             plain = jats_xml_to_text(xml_bytes)
             meta = {
@@ -208,18 +335,29 @@ def main() -> None:
                 "YEAR": a.pub_year or "",
                 "AUTHORS": a.author_string or "",
             }
-            path = save_text(outdir, a.pmcid, meta, plain)
-            print(f"Saved: {path}")
-            saved.append(path)
-        except requests.HTTPError as e:
-            # Common: 404 if OA XML not available for this PMCID
-            print(f"Skipping {a.pmcid}: HTTP {e.response.status_code if e.response else 'ERR'}")
-        except Exception as e:  # noqa: BLE001
-            print(f"Skipping {a.pmcid}: {e}")
+            txt_path = save_text(outdir, a.pmcid, meta, plain)
 
-    if not saved:
-        print("No OA full texts saved. Try increasing --limit or adjusting --query.")
+            downloaded += 1
+            # Real-time per-download message
+            log(f"Downloaded #{downloaded:,} (streamed={streamed:,}): {a.pmcid} | XML={raw_xml_path} | TXT={txt_path}")
+
+            if args.max_downloads and downloaded >= args.max_downloads:
+                log("Reached --max-downloads cap; stopping.")
+                break
+
+        except requests.HTTPError as e:
+            http_errors += 1
+            status = e.response.status_code if e.response is not None else "ERR"
+            log(f"HTTP error for {a.pmcid}: {status} (continuing)")
+        except Exception as e:  # noqa: BLE001
+            other_errors += 1
+            log(f"Error for {a.pmcid}: {e} (continuing)")
+
+    log("Done.")
+    log(f"Totals: streamed={streamed:,} downloaded={downloaded:,} skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} skipped(already)={skipped_already:,} http_errors={http_errors:,} other_errors={other_errors:,}")
+    log(f"Manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
     main()
+

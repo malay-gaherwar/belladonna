@@ -106,6 +106,9 @@ client = OpenAI(
     base_url=CONFIG["API"]["BASE_URL"],
 )
 
+print("🔧 Using API endpoint :", CONFIG["API"]["BASE_URL"])
+print("🔧 Using API key      :", "(empty)" if not CONFIG["API"]["API_KEY"] else CONFIG["API"]["API_KEY"][:8] + "...")
+
 def chat_create(messages):
     """Structured output call for your local LLM."""
     return client.chat.completions.create(
