@@ -241,7 +241,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Download Europe PMC full texts using cursorMark deep paging.")
     ap.add_argument(
         "--query",
-        default='("breast cancer") AND OPEN_ACCESS:Y',
+        default='('"breast cancer"') AND OPEN_ACCESS:Y',
         help="Europe PMC query string. Recommended for bulk full-text: add OPEN_ACCESS:Y",
     )
     ap.add_argument(
