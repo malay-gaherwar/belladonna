@@ -1,247 +1,259 @@
 #!/usr/bin/env python3
 """
-Fetch Elsevier full text (XML) via the Content API and save clean body text
-as one sentence per line.
+Search Elsevier (Scopus Search API) and attempt to fetch full text XML
+(Elsevier Content API). Save results EPMC-style.
 
-Usage:
-  python scripts/fetch_elsevier.py --doi 10.1016/j.annonc.2022.07.007 -o out.txt
-  python scripts/fetch_elsevier.py --pii S0923753422018580                # auto-named
-
-Requires:
-  - Python 3.9+
-  - pip install lxml requests
-
-Env:
-  - ELSEVIER_API_KEY=<your key>
+Header order (FIXED):
+TITLE
+DOI
+PMID
+JOURNAL
+YEAR
+AUTHORS
+(then remaining metadata)
 """
 
 from __future__ import annotations
+
 import argparse
+import json
 import os
-import re
-import sys
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Optional
+
 import requests
 from lxml import etree
 
-API_BASE = "https://api.elsevier.com/content/article"
+
+# ------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------
+SCOPUS_SEARCH_API = "https://api.elsevier.com/content/search/scopus"
+CONTENT_API = "https://api.elsevier.com/content/article"
+DEFAULT_QUERY = "breast cancer"
+DEFAULT_TOP_K = 5
 TIMEOUT = 30
 
 
-def _api_get_fullxml(doi: Optional[str], pii: Optional[str], api_key: str) -> str:
-    """
-    Call Elsevier Content API for FULL XML.
-    Tries DOI first if provided, otherwise PII.
-    Returns XML string.
-    """
-    headers = {
-        "X-ELS-APIKey": api_key,
-        "Accept": "application/xml",
+# ------------------------------------------------------------------
+# Data model
+# ------------------------------------------------------------------
+@dataclass(frozen=True)
+class Article:
+    title: str
+    doi: Optional[str]
+    pii: Optional[str]
+    pmid: Optional[str]
+    journal: Optional[str]
+    year: Optional[str]
+    scopus_id: Optional[str]
+    eid: Optional[str]
+    authors: list[str]
+    subtype: Optional[str]
+    open_access: Optional[bool]
+    scopus_link: Optional[str]
+
+    @property
+    def identifier(self) -> Optional[str]:
+        return self.doi or self.pii
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def safe_identifier(s: str) -> str:
+    return s.replace("/", "_").replace(":", "_").replace("\\", "_")
+
+
+def normalize_scopus_id(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    return s.replace("SCOPUS_ID:", "").strip()
+
+
+def year_from_date(s: Optional[str]) -> Optional[str]:
+    return s[:4] if s else None
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def already_downloaded_fulltext(outdir: Path, ident: str) -> bool:
+    return (outdir / f"{ident}.txt").exists() and (outdir / "xml" / f"{ident}.xml").exists()
+
+
+# ------------------------------------------------------------------
+# Search (Scopus Search API) — view=COMPLETE is critical
+# ------------------------------------------------------------------
+def search_scopus(query: str, api_key: str, count: int) -> list[Article]:
+    headers = {"X-ELS-APIKey": api_key, "Accept": "application/json"}
+    params = {
+        "query": query,
+        "count": count,
+        "sort": "relevancy",
+        "view": "COMPLETE",
     }
-    params = {"view": "FULL"}  # FULL gives xocs:doc + rich structure
+
+    r = requests.get(SCOPUS_SEARCH_API, headers=headers, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    entries = data.get("search-results", {}).get("entry", []) or []
+    articles: list[Article] = []
+
+    for e in entries:
+        authors = [a["authname"] for a in e.get("author", []) if a.get("authname")]
+
+        articles.append(
+            Article(
+                title=e.get("dc:title", ""),
+                doi=e.get("prism:doi"),
+                pii=e.get("pii"),
+                pmid=e.get("pubmed-id"),
+                journal=e.get("prism:publicationName"),
+                year=year_from_date(e.get("prism:coverDate")),
+                scopus_id=normalize_scopus_id(e.get("dc:identifier")),
+                eid=e.get("eid"),
+                authors=authors,
+                subtype=e.get("subtypeDescription") or e.get("subtype"),
+                open_access=bool(int(e["openaccess"])) if str(e.get("openaccess", "")).isdigit() else None,
+                scopus_link=next(
+                    (l.get("@href") for l in e.get("link", []) if l.get("@ref") == "scopus"),
+                    None,
+                ),
+            )
+        )
+
+    return articles
+
+
+# ------------------------------------------------------------------
+# Full text retrieval
+# ------------------------------------------------------------------
+def fetch_fulltext_xml(doi: Optional[str], pii: Optional[str], api_key: str) -> bytes:
+    headers = {"X-ELS-APIKey": api_key, "Accept": "application/xml"}
+    params = {"view": "FULL"}
 
     if doi:
-        url = f"{API_BASE}/doi/{doi}"
+        url = f"{CONTENT_API}/doi/{doi}"
     elif pii:
-        url = f"{API_BASE}/pii/{pii}"
+        url = f"{CONTENT_API}/pii/{pii}"
     else:
-        raise ValueError("Provide either DOI or PII")
+        raise ValueError("No DOI or PII")
 
     r = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
-    # Helpful diagnostics
-    if r.status_code == 404:
-        raise RuntimeError("Elsevier API returned 404 (not found) — check DOI/PII or access.")
-    if r.status_code == 401:
-        raise RuntimeError("Elsevier API returned 401 (unauthorized) — check API key.")
-    if r.status_code == 403:
-        raise RuntimeError("Elsevier API returned 403 (forbidden) — your key may not have entitlements.")
     r.raise_for_status()
-
-    # Ensure we really got XML
-    ctype = r.headers.get("Content-Type", "")
-    if "xml" not in ctype:
-        # Occasionally the API may send JSON error text; include a tail for debugging
-        snippet = r.text[:200].replace("\n", " ")
-        raise RuntimeError(f"Expected XML, got '{ctype}'. Payload starts with: {snippet!r}")
-
-    return r.text
+    return r.content
 
 
-def _first(elts: List[etree._Element]) -> Optional[etree._Element]:
-    return elts[0] if elts else None
+# ------------------------------------------------------------------
+# XML → text
+# ------------------------------------------------------------------
+def _itertext(elem: etree._Element) -> str:
+    return " ".join(" ".join(t.split()) for t in elem.itertext() if t.strip())
 
 
-def extract_body_paragraphs(xml_str: str) -> List[str]:
-    """
-    Parse Elsevier full XML and return clean paragraph texts from the article body.
-    This is namespace-agnostic JATS/Elsevier-XML parsing using local-name().
-    We explicitly skip references, figures, tables, footnotes, appendices, etc.
-    """
-    parser = etree.XMLParser(recover=True, remove_comments=True)
-    root = etree.fromstring(xml_str.encode("utf-8"), parser=parser)
+def extract_text_from_xml(xml_bytes: bytes) -> str:
+    root = etree.fromstring(xml_bytes, etree.XMLParser(recover=True))
+    bodies = root.xpath("//*[local-name()='body' or local-name()='doc-body' or local-name()='ce:body']")
+    if not bodies:
+        return ""
 
-    # Some records expose a nested 'originalText' element that itself contains the article XML as text.
-    # If found, prefer parsing that inner XML.
-    original_text_el = _first(root.xpath("//*[local-name()='originalText']"))
-    if original_text_el is not None:
-        inner = (original_text_el.text or "").strip()
-        if inner.startswith("<"):
-            try:
-                root = etree.fromstring(inner.encode("utf-8"), parser=parser)
-            except etree.XMLSyntaxError:
-                # Fall back to outer tree if inner parsing fails
-                pass
+    body = bodies[0]
+    for tag in ("fig", "table", "ref", "ref-list", "references", "appendix", "footnote"):
+        for n in body.xpath(f".//*[local-name()='{tag}']"):
+            n.clear()
 
-    # Locate body; Elsevier variants include ce:body, xocs:doc-body, or JATS body
-    body = _first(
-        root.xpath(
-            "//*[local-name()='body' or local-name()='doc-body' or local-name()='ce:body']"
-        )
-    )
-    if body is None:
-        # Some records wrap content in xocs:doc; then dive to body again
-        xocs_doc = _first(root.xpath("//*[local-name()='doc' and contains(name(), 'xocs')]"))
-        if xocs_doc is not None:
-            body = _first(
-                xocs_doc.xpath(".//*[local-name()='body' or local-name()='doc-body' or local-name()='ce:body']")
-            )
-    if body is None:
-        # As a last resort, try any section-like content
-        body = _first(root.xpath("//*[local-name()='sections' or local-name()='section']"))
-    if body is None:
-        raise RuntimeError("Could not locate article body in XML (unexpected schema).")
+    blocks: list[str] = []
+    for sec in body.xpath(".//*[local-name()='section' or local-name()='sec']"):
+        title = sec.xpath("./*[local-name()='title']")
+        if title:
+            blocks.append(_itertext(title[0]))
+        for p in sec.xpath(".//*[local-name()='p' or local-name()='para']"):
+            blocks.append(_itertext(p))
 
-    excluded_ancestors = {
-        "references",
-        "bibliography",
-        "ref",
-        "table",
-        "figure",
-        "fig",
-        "e-component",
-        "footnote",
-        "footnotes",
-        "acknowledge",
-        "acknowledgement",
-        "acknowledgements",
-        "appendix",
-        "appendices",
-        "back",
-        "caption",
-        "tbl",
-        "equation",
-        "chem-struct",
-    }
-
-    def is_excluded(node: etree._Element) -> bool:
-        for anc in node.iterancestors():
-            if etree.QName(anc).localname.lower() in excluded_ancestors:
-                return True
-        return False
-
-    # Grab paragraphs and also section titles (as standalone lines to preserve structure)
-    paras = body.xpath(".//*[local-name()='p' or local-name()='para' or local-name()='simple-para']")
-    titles = body.xpath(".//*[local-name()='section']/*[local-name()='title']")
-
-    def clean_text(node: etree._Element) -> str:
-        txt = " ".join(" ".join(node.itertext()).split())
-        return txt
-
-    texts: List[str] = []
-
-    # Include titles (as block lines) first, in order
-    for t in titles:
-        if not is_excluded(t):
-            c = clean_text(t)
-            if c:
-                texts.append(c)
-
-    # Then include paragraphs
-    for p in paras:
-        if not is_excluded(p):
-            c = clean_text(p)
-            if c:
-                texts.append(c)
-
-    # Deduplicate while preserving order (sometimes titles reappear)
-    seen = set()
-    uniq: List[str] = []
-    for t in texts:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
+    return "\n\n".join(b for b in blocks if b)
 
 
-_ABBREV = [
-    "e.g.", "i.e.", "vs.", "Fig.", "Figs.", "Dr.", "Prof.", "et al.", "No.", "Inc.", "Ltd.",
-    "Mr.", "Ms.", "Mrs.", "Jr.", "Sr.", "St.", "Eq.", "Ref.", "Refs.", "et al.",
-]
+# ------------------------------------------------------------------
+# Save helpers (ORDER FIXED)
+# ------------------------------------------------------------------
+def save_raw_xml(outdir: Path, ident: str, xml_bytes: bytes) -> None:
+    xml_dir = outdir / "xml"
+    ensure_dir(xml_dir)
+    (xml_dir / f"{ident}.xml").write_bytes(xml_bytes)
 
 
-def sentence_split(lines: Iterable[str]) -> List[str]:
-    """
-    Simple, robust sentence splitter for scientific prose.
-    - Works across headings and inline citations.
-    - Avoids splitting after common abbreviations.
-    """
-    out: List[str] = []
-    for block in lines:
-        text = " ".join(block.split())
+def save_text(outdir: Path, ident: str, art: Article, content: str) -> None:
+    ensure_dir(outdir)
+    path = outdir / f"{ident}.txt"
 
-        # protect abbreviations
-        protected = text
-        for a in _ABBREV:
-            protected = protected.replace(a, a.replace(".", "§"))
+    # ---- FIXED HEADER ORDER ----
+    header_lines = [
+        f"TITLE: {art.title}",
+        f"DOI: {art.doi or ''}",
+        f"PMID: {art.pmid or ''}",
+        f"JOURNAL: {art.journal or ''}",
+        f"YEAR: {art.year or ''}",
+        f"AUTHORS: {'; '.join(art.authors)}",
+        f"SCOPUS_ID: {art.scopus_id or ''}",
+        f"EID: {art.eid or ''}",
+        f"SUBTYPE: {art.subtype or ''}",
+        f"OPEN_ACCESS: {'' if art.open_access is None else art.open_access}",
+        f"SCOPUS_LINK: {art.scopus_link or ''}",
+    ]
 
-        # split on [.?!] followed by space + uppercase or '('
-        parts = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z(])", protected)
+    sep = "\n" + ("-" * 80) + "\n"
 
-        # restore dots and clean
-        for p in parts:
-            s = p.replace("§", ".").strip()
-            if s:
-                out.append(s)
-    return out
+    with path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(header_lines))
+        f.write(sep)
+        f.write(content)
+        f.write("\n")
 
 
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch Elsevier full text and save one sentence per line.")
-    g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("--doi", type=str, help="Article DOI")
-    g.add_argument("--pii", type=str, help="Article PII (e.g., S0923753422018580)")
-    parser.add_argument("-o", "--out", type=Path, help="Output .txt path (default based on DOI/PII)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", default=DEFAULT_QUERY)
+    ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    ap.add_argument("--outdir", default="artifacts/elsevier_fulltext")
+    args = ap.parse_args()
 
     api_key = os.getenv("ELSEVIER_API_KEY")
     if not api_key:
-        print("ERROR: Set ELSEVIER_API_KEY in your environment.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("ELSEVIER_API_KEY not set")
 
-    try:
-        xml = _api_get_fullxml(args.doi, args.pii, api_key)
-        paras = extract_body_paragraphs(xml)
-        sentences = sentence_split(paras)
-        if not sentences:
-            raise RuntimeError("No sentences extracted from body.")
+    outdir = Path(args.outdir)
+    ensure_dir(outdir)
+    ensure_dir(outdir / "xml")
 
-        if args.out:
-            out_path = args.out
-        else:
-            stem = (args.doi or args.pii).replace("/", "_")
-            out_path = Path(f"elsevier_{stem}.txt")
+    articles = search_scopus(args.query, api_key, args.top_k)
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            for s in sentences:
-                f.write(s + "\n")
+    for i, art in enumerate(articles, 1):
+        if not art.identifier:
+            continue
 
-        print(f"✅ Wrote {len(sentences)} sentences to: {out_path}")
+        ident = safe_identifier(art.identifier)
 
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(2)
+        if already_downloaded_fulltext(outdir, ident):
+            continue
+
+        try:
+            xml = fetch_fulltext_xml(art.doi, art.pii, api_key)
+            save_raw_xml(outdir, ident, xml)
+
+            text = extract_text_from_xml(xml)
+            save_text(outdir, ident, art, text)
+
+            print(f"[{i}] SAVED FULLTEXT: {ident}")
+
+        except Exception as e:
+            print(f"[{i}] FULLTEXT UNAVAILABLE: {ident} ({e})")
 
 
 if __name__ == "__main__":
