@@ -8,7 +8,9 @@ __pycache__/
 .build/
 dist/
 scripts/test.py
-
+AGO_REF_PDF
+E_REF_PDF
+sample_text.txt
 # Jupyter
 .ipynb_checkpoints/
 

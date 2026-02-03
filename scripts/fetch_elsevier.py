@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Elsevier / Scopus ingestion pipeline (LOSSLESS, OFFSET PAGINATION).
+Elsevier / Scopus ingestion pipeline (LOSSLESS, CURSOR PAGINATION).
+
+Implements cursor pagination EXACTLY as documented by Elsevier:
+- First request uses cursor=*
+- Subsequent requests follow the 'link ref=next' URL verbatim
+- No offset paging
+- No fallback
 
 FULLTEXT:
   artifacts/elsevier/xml/<SCOPUS_ID>.xml
 
 META-ONLY:
   artifacts/elsevier/only_meta/<SCOPUS_ID>.json
-
-Notes:
-- Offset-based pagination (start/count)
-- Meta-only is expected and NOT an error
-- Raw formats only (no parsing, no transformation)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -37,14 +39,19 @@ CONFIG = {
     "TIMEOUT": 60,
 
     "QUERY": "breast cancer",
-    "PAGE_SIZE": 25,          # Scopus max
+    "COUNT": 200,                 # max allowed
     "SLEEP_SECONDS": 0.25,
 
-    "START_AT": 0,            # resume offset
-    "MAX_STREAM": 0,          # 0 = unlimited
+    # >>> NEW <<<
+    "START_STREAMED": 301700,    # restart from here (set to 0 for fresh run)
+    "MAX_STREAM": 0,             # 0 = unlimited
 
     "OUTDIR": "artifacts/elsevier",
     "LOG_PREFIX": "fetch_elsevier",
+
+    # >>> NEW <<<
+    "MAX_RETRIES": 6,            # for 5xx errors
+    "BACKOFF_BASE": 1.0,         # seconds
 }
 
 
@@ -81,47 +88,79 @@ def ensure_dir(p: Path) -> None:
 
 
 # ======================================================================
-# Offset-based Scopus Search
+# Cursor-based Scopus Search (OFFICIAL METHOD + RETRIES)
 # ======================================================================
 def iter_scopus_search(
     session: requests.Session,
     api_key: str,
     query: str,
-    page_size: int,
+    count: int,
     sleep_s: float,
 ) -> Iterator[Dict[str, Any]]:
-    start = 0
+    """
+    Cursor pagination following Elsevier documentation:
+    - Start with cursor=*
+    - Then follow link ref='next' exactly
+    - Retries on HTTP 5xx with exponential backoff
+    """
 
-    while True:
-        params = {
-            "query": query,
-            "count": page_size,
-            "start": start,
-            "view": "COMPLETE",
-        }
-        headers = {
-            "X-ELS-APIKey": api_key,
-            "Accept": "application/json",
-        }
+    headers = {
+        "X-ELS-APIKey": api_key,
+        "Accept": "application/json",
+    }
 
-        r = session.get(
-            CONFIG["SCOPUS_SEARCH_BASE"],
-            headers=headers,
-            params=params,
-            timeout=CONFIG["TIMEOUT"],
-        )
-        r.raise_for_status()
+    next_url = (
+        f"{CONFIG['SCOPUS_SEARCH_BASE']}?"
+        f"query={query.replace(' ', '+')}&cursor=*&count={count}"
+    )
+
+    page = 0
+
+    while next_url:
+        page += 1
+        log(f"Fetching page {page}")
+
+        # >>> NEW: retry loop <<<
+        for attempt in range(1, CONFIG["MAX_RETRIES"] + 1):
+            try:
+                r = session.get(next_url, headers=headers, timeout=CONFIG["TIMEOUT"])
+                r.raise_for_status()
+                break
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response else None
+                if status and 500 <= status < 600 and attempt < CONFIG["MAX_RETRIES"]:
+                    backoff = (
+                        CONFIG["BACKOFF_BASE"]
+                        * (2 ** (attempt - 1))
+                        + random.uniform(0, 0.3)
+                    )
+                    log(
+                        f"HTTP {status} on page fetch "
+                        f"(attempt {attempt}/{CONFIG['MAX_RETRIES']}), "
+                        f"retrying in {backoff:.1f}s"
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise
+
         data = r.json()
 
-        entries = data.get("search-results", {}).get("entry", []) or []
+        sr = data.get("search-results", {}) or {}
+        entries = sr.get("entry", []) or []
         if not entries:
             return
 
         for e in entries:
             yield e
 
-        start += len(entries)
-        time.sleep(sleep_s)
+        next_url = None
+        for link in sr.get("link", []):
+            if link.get("@ref") == "next" and link.get("@href"):
+                next_url = link["@href"]
+                break
+
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
 
 # ======================================================================
@@ -174,21 +213,23 @@ def main() -> None:
     errors = 0
 
     log(f"QUERY: {CONFIG['QUERY']}")
-    log(f"PAGE_SIZE: {CONFIG['PAGE_SIZE']}")
-    log(f"START_AT: {CONFIG['START_AT']}")
-    log(f"MAX_STREAM: {CONFIG['MAX_STREAM'] or 'unlimited'}")
+    log("Pagination: CURSOR (official)")
+    log(f"COUNT: {CONFIG['COUNT']}")
+    log(f"START_STREAMED: {CONFIG['START_STREAMED']}")
 
     for entry in iter_scopus_search(
         session=session,
         api_key=api_key,
         query=CONFIG["QUERY"],
-        page_size=CONFIG["PAGE_SIZE"],
+        count=CONFIG["COUNT"],
         sleep_s=CONFIG["SLEEP_SECONDS"],
     ):
         streamed += 1
 
-        if streamed <= CONFIG["START_AT"]:
+        # >>> NEW: restart logic <<<
+        if streamed <= CONFIG["START_STREAMED"]:
             continue
+
         if CONFIG["MAX_STREAM"] and streamed > CONFIG["MAX_STREAM"]:
             break
 
@@ -215,8 +256,8 @@ def main() -> None:
 
             log(
                 f"Downloaded #{downloaded:,} "
-                f"(streamed={streamed:,}, saved full-text={saved_full:,}, saved meta-data={saved_meta:,}): "
-                f"{scopus_id} | XML={xml_path}"
+                f"(streamed={streamed:,}, full-text={saved_full:,}, meta={saved_meta:,}): "
+                f"{scopus_id} | XML"
             )
 
         except requests.HTTPError:
@@ -228,8 +269,8 @@ def main() -> None:
 
             log(
                 f"Downloaded #{downloaded:,} "
-                f"(streamed={streamed:,}, saved full-text={saved_full:,}, saved meta-data={saved_meta:,}): "
-                f"{scopus_id} | META_ONLY={meta_path}"
+                f"(streamed={streamed:,}, full-text={saved_full:,}, meta={saved_meta:,}): "
+                f"{scopus_id} | META_ONLY"
             )
 
         except Exception as e:

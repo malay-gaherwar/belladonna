@@ -253,7 +253,7 @@ def main() -> None:
         "--page-size",
         type=int,
         default=1000,
-        help="Search page size for cursorMark paging (use 1000 unless you have a reason).",
+        help="Search page size for cursorMark paging .",
     )
     ap.add_argument(
         "--sleep",
