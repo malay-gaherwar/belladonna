@@ -1,247 +1,294 @@
 #!/usr/bin/env python3
 """
-Fetch Elsevier full text (XML) via the Content API and save clean body text
-as one sentence per line.
+Elsevier / Scopus ingestion pipeline (LOSSLESS, CURSOR PAGINATION).
 
-Usage:
-  python scripts/fetch_elsevier.py --doi 10.1016/j.annonc.2022.07.007 -o out.txt
-  python scripts/fetch_elsevier.py --pii S0923753422018580                # auto-named
+Implements cursor pagination EXACTLY as documented by Elsevier:
+- First request uses cursor=*
+- Subsequent requests follow the 'link ref=next' URL verbatim
+- No offset paging
+- No fallback
 
-Requires:
-  - Python 3.9+
-  - pip install lxml requests
+FULLTEXT:
+  artifacts/elsevier/xml/<SCOPUS_ID>.xml
 
-Env:
-  - ELSEVIER_API_KEY=<your key>
+META-ONLY:
+  artifacts/elsevier/only_meta/<SCOPUS_ID>.json
 """
 
 from __future__ import annotations
-import argparse
+
+import json
 import os
+import random
 import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterator, Optional
+
 import requests
-from lxml import etree
-
-API_BASE = "https://api.elsevier.com/content/article"
-TIMEOUT = 30
 
 
-def _api_get_fullxml(doi: Optional[str], pii: Optional[str], api_key: str) -> str:
+# ======================================================================
+# CONFIG
+# ======================================================================
+CONFIG = {
+    "SCOPUS_SEARCH_BASE": "https://api.elsevier.com/content/search/scopus",
+    "ARTICLE_RETRIEVAL_BASE": "https://api.elsevier.com/content/article",
+    "TIMEOUT": 60,
+
+    "QUERY": 'TITLE-ABS-KEY("breast cancer")',
+    "COUNT": 25,                 # max allowed
+    "SLEEP_SECONDS": 0.25,
+
+    # >>> NEW <<<
+    "START_STREAMED": 123400,    # restart from here (set to 0 for fresh run)
+    "MAX_STREAM": 0,             # 0 = unlimited
+
+    "OUTDIR": "artifacts/elsevier",
+    "LOG_PREFIX": "fetch_elsevier",
+
+    # >>> NEW <<<
+    "MAX_RETRIES": 6,            # for 5xx errors
+    "BACKOFF_BASE": 1.0,         # seconds
+}
+
+
+# ======================================================================
+# Logging
+# ======================================================================
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOGS_DIR / f"{CONFIG['LOG_PREFIX']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+
+def log(msg: str) -> None:
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ======================================================================
+# Helpers
+# ======================================================================
+def safe_id(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+
+
+def extract_scopus_id(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    return raw.replace("SCOPUS_ID:", "").strip()
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# ======================================================================
+# Cursor-based Scopus Search (OFFICIAL METHOD + RETRIES)
+# ======================================================================
+def iter_scopus_search(
+    session: requests.Session,
+    api_key: str,
+    query: str,
+    count: int,
+    sleep_s: float,
+) -> Iterator[Dict[str, Any]]:
     """
-    Call Elsevier Content API for FULL XML.
-    Tries DOI first if provided, otherwise PII.
-    Returns XML string.
+    Cursor pagination following Elsevier documentation:
+    - Start with cursor=*
+    - Then follow link ref='next' exactly
+    - Retries on HTTP 5xx with exponential backoff
     """
+
+    headers = {
+        "X-ELS-APIKey": api_key,
+        "Accept": "application/json",
+    }
+
+    next_url = (
+        f"{CONFIG['SCOPUS_SEARCH_BASE']}?"
+        f"query={query.replace(' ', '+')}&cursor=*&count={count}&sort=coverDate"
+    )
+
+    page = 0
+
+    while next_url:
+        page += 1
+        log(f"Fetching page {page}")
+
+        # >>> NEW: retry loop <<<
+        for attempt in range(1, CONFIG["MAX_RETRIES"] + 1):
+            try:
+                r = session.get(next_url, headers=headers, timeout=CONFIG["TIMEOUT"])
+                r.raise_for_status()
+                break
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status and 500 <= status < 600 and attempt < CONFIG["MAX_RETRIES"]:
+                    backoff = (
+                        CONFIG["BACKOFF_BASE"]
+                        * (2 ** (attempt - 1))
+                        + random.uniform(0, 0.3)
+                    )
+                    log(
+                        f"HTTP {status} on page fetch "
+                        f"(attempt {attempt}/{CONFIG['MAX_RETRIES']}), "
+                        f"retrying in {backoff:.1f}s"
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise
+
+        data = r.json()
+        # Add this to iter_scopus_search in your script:
+        actual_query = data.get('search-results', {}).get('opensearch:Query', {}).get('@searchTerms')
+        log(f"API verified query: {actual_query}")
+        sr = data.get("search-results", {}) or {}
+        entries = sr.get("entry", []) or []
+        if not entries:
+            return
+
+        for e in entries:
+            yield e
+
+        next_url = None
+        for link in sr.get("link", []):
+            if link.get("@ref") == "next" and link.get("@href"):
+                next_url = link["@href"]
+                break
+
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+
+# ======================================================================
+# Article Retrieval API (RAW XML)
+# ======================================================================
+def fetch_fulltext_xml(
+    session: requests.Session,
+    api_key: str,
+    doi: str,
+    pii: str,
+) -> bytes:
     headers = {
         "X-ELS-APIKey": api_key,
         "Accept": "application/xml",
     }
-    params = {"view": "FULL"}  # FULL gives xocs:doc + rich structure
+    params = {"view": "FULL"}
 
     if doi:
-        url = f"{API_BASE}/doi/{doi}"
+        url = f"{CONFIG['ARTICLE_RETRIEVAL_BASE']}/doi/{doi}"
     elif pii:
-        url = f"{API_BASE}/pii/{pii}"
+        url = f"{CONFIG['ARTICLE_RETRIEVAL_BASE']}/pii/{pii}"
     else:
-        raise ValueError("Provide either DOI or PII")
+        raise ValueError("No DOI/PII")
 
-    r = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
-    # Helpful diagnostics
-    if r.status_code == 404:
-        raise RuntimeError("Elsevier API returned 404 (not found) — check DOI/PII or access.")
-    if r.status_code == 401:
-        raise RuntimeError("Elsevier API returned 401 (unauthorized) — check API key.")
-    if r.status_code == 403:
-        raise RuntimeError("Elsevier API returned 403 (forbidden) — your key may not have entitlements.")
+    r = session.get(url, headers=headers, params=params, timeout=CONFIG["TIMEOUT"])
     r.raise_for_status()
-
-    # Ensure we really got XML
-    ctype = r.headers.get("Content-Type", "")
-    if "xml" not in ctype:
-        # Occasionally the API may send JSON error text; include a tail for debugging
-        snippet = r.text[:200].replace("\n", " ")
-        raise RuntimeError(f"Expected XML, got '{ctype}'. Payload starts with: {snippet!r}")
-
-    return r.text
+    return r.content
 
 
-def _first(elts: List[etree._Element]) -> Optional[etree._Element]:
-    return elts[0] if elts else None
-
-
-def extract_body_paragraphs(xml_str: str) -> List[str]:
-    """
-    Parse Elsevier full XML and return clean paragraph texts from the article body.
-    This is namespace-agnostic JATS/Elsevier-XML parsing using local-name().
-    We explicitly skip references, figures, tables, footnotes, appendices, etc.
-    """
-    parser = etree.XMLParser(recover=True, remove_comments=True)
-    root = etree.fromstring(xml_str.encode("utf-8"), parser=parser)
-
-    # Some records expose a nested 'originalText' element that itself contains the article XML as text.
-    # If found, prefer parsing that inner XML.
-    original_text_el = _first(root.xpath("//*[local-name()='originalText']"))
-    if original_text_el is not None:
-        inner = (original_text_el.text or "").strip()
-        if inner.startswith("<"):
-            try:
-                root = etree.fromstring(inner.encode("utf-8"), parser=parser)
-            except etree.XMLSyntaxError:
-                # Fall back to outer tree if inner parsing fails
-                pass
-
-    # Locate body; Elsevier variants include ce:body, xocs:doc-body, or JATS body
-    body = _first(
-        root.xpath(
-            "//*[local-name()='body' or local-name()='doc-body' or local-name()='ce:body']"
-        )
-    )
-    if body is None:
-        # Some records wrap content in xocs:doc; then dive to body again
-        xocs_doc = _first(root.xpath("//*[local-name()='doc' and contains(name(), 'xocs')]"))
-        if xocs_doc is not None:
-            body = _first(
-                xocs_doc.xpath(".//*[local-name()='body' or local-name()='doc-body' or local-name()='ce:body']")
-            )
-    if body is None:
-        # As a last resort, try any section-like content
-        body = _first(root.xpath("//*[local-name()='sections' or local-name()='section']"))
-    if body is None:
-        raise RuntimeError("Could not locate article body in XML (unexpected schema).")
-
-    excluded_ancestors = {
-        "references",
-        "bibliography",
-        "ref",
-        "table",
-        "figure",
-        "fig",
-        "e-component",
-        "footnote",
-        "footnotes",
-        "acknowledge",
-        "acknowledgement",
-        "acknowledgements",
-        "appendix",
-        "appendices",
-        "back",
-        "caption",
-        "tbl",
-        "equation",
-        "chem-struct",
-    }
-
-    def is_excluded(node: etree._Element) -> bool:
-        for anc in node.iterancestors():
-            if etree.QName(anc).localname.lower() in excluded_ancestors:
-                return True
-        return False
-
-    # Grab paragraphs and also section titles (as standalone lines to preserve structure)
-    paras = body.xpath(".//*[local-name()='p' or local-name()='para' or local-name()='simple-para']")
-    titles = body.xpath(".//*[local-name()='section']/*[local-name()='title']")
-
-    def clean_text(node: etree._Element) -> str:
-        txt = " ".join(" ".join(node.itertext()).split())
-        return txt
-
-    texts: List[str] = []
-
-    # Include titles (as block lines) first, in order
-    for t in titles:
-        if not is_excluded(t):
-            c = clean_text(t)
-            if c:
-                texts.append(c)
-
-    # Then include paragraphs
-    for p in paras:
-        if not is_excluded(p):
-            c = clean_text(p)
-            if c:
-                texts.append(c)
-
-    # Deduplicate while preserving order (sometimes titles reappear)
-    seen = set()
-    uniq: List[str] = []
-    for t in texts:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
-
-
-_ABBREV = [
-    "e.g.", "i.e.", "vs.", "Fig.", "Figs.", "Dr.", "Prof.", "et al.", "No.", "Inc.", "Ltd.",
-    "Mr.", "Ms.", "Mrs.", "Jr.", "Sr.", "St.", "Eq.", "Ref.", "Refs.", "et al.",
-]
-
-
-def sentence_split(lines: Iterable[str]) -> List[str]:
-    """
-    Simple, robust sentence splitter for scientific prose.
-    - Works across headings and inline citations.
-    - Avoids splitting after common abbreviations.
-    """
-    out: List[str] = []
-    for block in lines:
-        text = " ".join(block.split())
-
-        # protect abbreviations
-        protected = text
-        for a in _ABBREV:
-            protected = protected.replace(a, a.replace(".", "§"))
-
-        # split on [.?!] followed by space + uppercase or '('
-        parts = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z(])", protected)
-
-        # restore dots and clean
-        for p in parts:
-            s = p.replace("§", ".").strip()
-            if s:
-                out.append(s)
-    return out
-
-
+# ======================================================================
+# Main
+# ======================================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch Elsevier full text and save one sentence per line.")
-    g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("--doi", type=str, help="Article DOI")
-    g.add_argument("--pii", type=str, help="Article PII (e.g., S0923753422018580)")
-    parser.add_argument("-o", "--out", type=Path, help="Output .txt path (default based on DOI/PII)")
-    args = parser.parse_args()
-
     api_key = os.getenv("ELSEVIER_API_KEY")
     if not api_key:
-        print("ERROR: Set ELSEVIER_API_KEY in your environment.", file=sys.stderr)
+        log("ERROR: ELSEVIER_API_KEY not set")
         sys.exit(1)
 
-    try:
-        xml = _api_get_fullxml(args.doi, args.pii, api_key)
-        paras = extract_body_paragraphs(xml)
-        sentences = sentence_split(paras)
-        if not sentences:
-            raise RuntimeError("No sentences extracted from body.")
+    outdir = Path(CONFIG["OUTDIR"])
+    ensure_dir(outdir / "xml")
+    ensure_dir(outdir / "only_meta")
 
-        if args.out:
-            out_path = args.out
-        else:
-            stem = (args.doi or args.pii).replace("/", "_")
-            out_path = Path(f"elsevier_{stem}.txt")
+    session = requests.Session()
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            for s in sentences:
-                f.write(s + "\n")
+    streamed = 0
+    downloaded = 0
+    saved_full = 0
+    saved_meta = 0
+    skipped_no_id = 0
+    errors = 0
 
-        print(f"✅ Wrote {len(sentences)} sentences to: {out_path}")
+    log(f"QUERY: {CONFIG['QUERY']}")
+    log("Pagination: CURSOR (official)")
+    log(f"COUNT: {CONFIG['COUNT']}")
+    log(f"START_STREAMED: {CONFIG['START_STREAMED']}")
 
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(2)
+    for entry in iter_scopus_search(
+        session=session,
+        api_key=api_key,
+        query=CONFIG["QUERY"],
+        count=CONFIG["COUNT"],
+        sleep_s=CONFIG["SLEEP_SECONDS"],
+    ):
+        streamed += 1
+
+        # >>> NEW: restart logic <<<
+        if streamed <= CONFIG["START_STREAMED"]:
+            continue
+
+        if CONFIG["MAX_STREAM"] and streamed > CONFIG["MAX_STREAM"]:
+            break
+
+        scopus_id = extract_scopus_id(entry.get("dc:identifier"))
+        if not scopus_id:
+            skipped_no_id += 1
+            continue
+
+        scid = safe_id(scopus_id)
+        xml_path = outdir / "xml" / f"{scid}.xml"
+        meta_path = outdir / "only_meta" / f"{scid}.json"
+
+        downloaded += 1
+
+        try:
+            xml = fetch_fulltext_xml(
+                session,
+                api_key,
+                entry.get("prism:doi", ""),
+                entry.get("pii", ""),
+            )
+            xml_path.write_bytes(xml)
+            saved_full += 1
+
+            log(
+                f"Downloaded #{downloaded:,} "
+                f"(streamed={streamed:,}, full-text={saved_full:,}, meta={saved_meta:,}): "
+                f"{scopus_id} | XML"
+            )
+
+        except requests.HTTPError:
+            meta_path.write_text(
+                json.dumps(entry, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            saved_meta += 1
+
+            log(
+                f"Downloaded #{downloaded:,} "
+                f"(streamed={streamed:,}, full-text={saved_full:,}, meta={saved_meta:,}): "
+                f"{scopus_id} | META_ONLY"
+            )
+
+        except Exception as e:
+            errors += 1
+            log(f"ERROR processing {scopus_id}: {e}")
+
+    log("Finished.")
+    log(
+        "Totals: "
+        f"streamed={streamed:,}, "
+        f"downloaded={downloaded:,}, "
+        f"saved full-text={saved_full:,}, "
+        f"saved meta-data={saved_meta:,}, "
+        f"skipped(no id)={skipped_no_id:,}, "
+        f"errors={errors:,}"
+    )
 
 
 if __name__ == "__main__":

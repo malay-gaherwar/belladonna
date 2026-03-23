@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Download full text from Europe PMC (OA subset) using cursorMark deep paging
-and save both raw JATS XML and extracted plain text.
+EPMC fulltext downloader with cursorMark deep paging + resume options.
 
-Key features:
-- Uses /search with cursorMark to iterate beyond 1000 results.
-- Downloads full text via /{PMCID}/fullTextXML (works for OA/PMCID items).
-- Saves:
-    artifacts/epmc_fulltext/PMCxxxxxxx.txt
-    artifacts/epmc_fulltext/xml/PMCxxxxxxx.xml
-- Prints real-time progress: how many records streamed and how many full texts downloaded.
-- Creates logs/ and writes a timestamped log file named after this script.
+Resume options:
+1) Best (exact): provide --start-cursor <cursorMark token>
+2) Fallback: provide --start-streamed N --skip-streamed
+   (This will re-stream from the beginning but do nothing until item N is reached.)
 
-Examples:
-    python scripts/epmc_fulltext.py
-    python scripts/epmc_fulltext.py --query '("breast cancer") AND OPEN_ACCESS:Y'
-    python scripts/epmc_fulltext.py --query '("breast cancer") AND OPEN_ACCESS:Y' --outdir artifacts/epmc_fulltext --page-size 1000
+Defaults:
+- start_streamed defaults to 66129 and skip-streamed is enabled by default,
+  so it effectively resumes at ~66,129th streamed record.
+
+Outputs:
+- artifacts/epmc_fulltext/PMCxxxxxxx.txt
+- artifacts/epmc_fulltext/xml/PMCxxxxxxx.xml
+- logs/<script>_YYYYmmdd_HHMMSS.log
 """
 
 from __future__ import annotations
@@ -30,6 +29,8 @@ from typing import Any, Iterator, Mapping, Sequence, Union, cast
 
 import requests
 import xml.etree.ElementTree as ET
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ---- Requests typing helpers (keeps mypy happy) ----
@@ -39,6 +40,9 @@ Params = Mapping[str, ParamValue]
 
 SEARCH_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 FULLTEXT_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+
+# Your requested starting number (fallback resume mode)
+START_STREAMED_DEFAULT = 66129
 
 
 @dataclass(frozen=True)
@@ -71,10 +75,6 @@ class Article:
 
 
 def make_logger(script_path: str | None) -> tuple[Path, callable]:
-    """
-    Create logs/ and a log file named: <script_stem>_YYYYmmdd_HHMMSS.log
-    Returns (log_path, log_fn).
-    """
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,18 +84,43 @@ def make_logger(script_path: str | None) -> tuple[Path, callable]:
 
     def log(msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-        print(line)
+        print(line, flush=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
     return log_path, log
 
 
-def epmc_search_page(query: str, page_size: int, cursor_mark: str, session: requests.Session) -> tuple[list[Article], str]:
-    """
-    Fetch one page using cursorMark deep paging.
-    Returns (articles, next_cursor_mark).
-    """
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=8,
+        connect=8,
+        read=8,
+        status=8,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+
+    s = requests.Session()
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update(
+        {"User-Agent": "belladonna-epmc-harvester/1.0 (+https://github.com/KatherLab/belladonna)"}
+    )
+    return s
+
+
+def epmc_search_page(
+    query: str,
+    page_size: int,
+    cursor_mark: str,
+    session: requests.Session,
+    timeout_s: float,
+) -> tuple[list[Article], str]:
     params: Params = {
         "query": query,
         "format": "json",
@@ -103,7 +128,7 @@ def epmc_search_page(query: str, page_size: int, cursor_mark: str, session: requ
         "resultType": "lite",
         "cursorMark": cursor_mark,
     }
-    r = session.get(SEARCH_BASE, params=params, timeout=30)
+    r = session.get(SEARCH_BASE, params=params, timeout=timeout_s)
     r.raise_for_status()
 
     data = cast(dict[str, Any], r.json())
@@ -113,14 +138,23 @@ def epmc_search_page(query: str, page_size: int, cursor_mark: str, session: requ
     return [Article.from_epmc(x) for x in results], next_cursor
 
 
-def iter_epmc_all(query: str, page_size: int, sleep_s: float, session: requests.Session) -> Iterator[Article]:
-    """
-    Stream all results for a query using cursorMark deep paging.
-    Stops when cursor stops advancing.
-    """
-    cursor = "*"
+def iter_epmc_all(
+    query: str,
+    page_size: int,
+    sleep_s: float,
+    session: requests.Session,
+    timeout_s: float,
+    start_cursor: str,
+) -> Iterator[Article]:
+    cursor = start_cursor
     while True:
-        page, next_cursor = epmc_search_page(query=query, page_size=page_size, cursor_mark=cursor, session=session)
+        page, next_cursor = epmc_search_page(
+            query=query,
+            page_size=page_size,
+            cursor_mark=cursor,
+            session=session,
+            timeout_s=timeout_s,
+        )
         if not page:
             return
 
@@ -135,15 +169,14 @@ def iter_epmc_all(query: str, page_size: int, sleep_s: float, session: requests.
             time.sleep(sleep_s)
 
 
-def fetch_fulltext_xml(pmcid: str, session: requests.Session) -> bytes:
+def fetch_fulltext_xml(pmcid: str, session: requests.Session, timeout_s: float) -> bytes:
     url = FULLTEXT_BASE.format(pmcid=pmcid)
-    r = session.get(url, timeout=60)
+    r = session.get(url, timeout=timeout_s)
     r.raise_for_status()
     return r.content
 
 
 def _itertext(elem: ET.Element) -> str:
-    # Robust, whitespace-normalized text extraction
     text_parts: list[str] = []
     for t in elem.itertext():
         s = " ".join(t.split())
@@ -153,22 +186,18 @@ def _itertext(elem: ET.Element) -> str:
 
 
 def _findall_anyns(root: ET.Element, tag: str) -> list[ET.Element]:
-    # Namespace-agnostic search: matches .//{*}tag
     return list(root.findall(f".//{{*}}{tag}"))
 
 
 def jats_xml_to_text(xml_bytes: bytes) -> str:
     root = ET.fromstring(xml_bytes)
 
-    # Title
     titles = _findall_anyns(root, "article-title")
     title = _itertext(titles[0]) if titles else ""
 
-    # Abstract(s)
     abstracts = _findall_anyns(root, "abstract")
     abstract_txt = "\n\n".join(_itertext(a) for a in abstracts) if abstracts else ""
 
-    # Body: exclude some noisy blocks by clearing their content
     body_elems = _findall_anyns(root, "body")
     body_txt_parts: list[str] = []
 
@@ -229,65 +258,63 @@ def save_raw_xml(outdir: Path, pmcid: str, xml_bytes: bytes) -> Path:
 
 
 def already_downloaded(outdir: Path, pmcid: str) -> bool:
-    """
-    Skip re-downloading if both XML and TXT already exist.
-    """
     txt_path = outdir / f"{pmcid}.txt"
     xml_path = outdir / "xml" / f"{pmcid}.xml"
     return txt_path.exists() and xml_path.exists()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Download Europe PMC full texts using cursorMark deep paging.")
+    ap = argparse.ArgumentParser(description="Download Europe PMC full texts using cursorMark deep paging (resume-friendly).")
     ap.add_argument(
         "--query",
-        default='('"breast cancer"') AND OPEN_ACCESS:Y',
-        help="Europe PMC query string. Recommended for bulk full-text: add OPEN_ACCESS:Y",
+        default='("breast cancer") AND OPEN_ACCESS:Y',
+        help="Europe PMC query string. Recommended for full-text harvest: add OPEN_ACCESS:Y",
+    )
+    ap.add_argument("--outdir", default="artifacts/epmc_fulltext", help="Output directory for .txt and raw XML files.")
+    ap.add_argument("--page-size", type=int, default=1000, help="Search page size for cursorMark paging.")
+    ap.add_argument("--sleep", type=float, default=0.1, help="Sleep seconds between search pages.")
+    ap.add_argument("--timeout-search", type=float, default=30.0, help="Timeout seconds for /search calls.")
+    ap.add_argument("--timeout-fulltext", type=float, default=90.0, help="Timeout seconds for fullTextXML calls.")
+    ap.add_argument("--max-downloads", type=int, default=0, help="Stop after N full texts. 0 means no cap.")
+    ap.add_argument("--manifest", default="artifacts/epmc_manifest.jsonl", help="JSONL file to append every streamed record (metadata).")
+
+    # Resume controls
+    ap.add_argument(
+        "--start-cursor",
+        default="",
+        help="Exact resume: start from this cursorMark token (best option if you saved it).",
     )
     ap.add_argument(
-        "--outdir",
-        default="artifacts/epmc_fulltext",
-        help="Output directory for .txt and raw XML files.",
-    )
-    ap.add_argument(
-        "--page-size",
+        "--start-streamed",
         type=int,
-        default=1000,
-        help="Search page size for cursorMark paging (use 1000 unless you have a reason).",
+        default=START_STREAMED_DEFAULT,
+        help=f"Fallback resume: pretend we already streamed N records (default {START_STREAMED_DEFAULT}).",
     )
     ap.add_argument(
-        "--sleep",
-        type=float,
-        default=0.1,
-        help="Sleep seconds between search pages (politeness / rate limiting).",
+        "--skip-streamed",
+        action="store_true",
+        default=True,
+        help="Fallback resume: while streamed < start-streamed, do NOT download anything (just advance). Default: enabled.",
     )
-    ap.add_argument(
-        "--max-downloads",
-        type=int,
-        default=0,
-        help="Safety cap: stop after downloading N full texts. 0 means no cap.",
-    )
-    ap.add_argument(
-        "--manifest",
-        default="artifacts/epmc_manifest.jsonl",
-        help="JSONL file to append every streamed record (metadata).",
-    )
+
     args = ap.parse_args()
+
+    log_path, log = make_logger(__file__ if "__file__" in globals() else None)
+    log(f"Log file: {log_path}")
+    log(f"Query: {args.query}")
+    log(f"Outdir: {args.outdir}")
+
+    if args.start_cursor:
+        log(f"Starting from cursorMark token (exact resume).")
+    else:
+        log(f"Starting from streamed={args.start_streamed:,} using skip-streamed={args.skip_streamed} (fallback resume).")
+        log("NOTE: This will re-stream from the beginning, but skip processing until the counter is reached.")
 
     outdir = Path(args.outdir)
     manifest_path = Path(args.manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    log_path, log = make_logger(__file__ if "__file__" in globals() else None)
-    log(f"Log file: {log_path}")
-    log(f"Query: {args.query}")
-    log(f"Outdir: {outdir}")
-    log(f"Page size: {args.page_size}")
-    log(f"Sleep: {args.sleep}s")
-    if args.max_downloads:
-        log(f"Max downloads: {args.max_downloads}")
-
-    session = requests.Session()
+    session = build_session()
 
     streamed = 0
     downloaded = 0
@@ -296,22 +323,37 @@ def main() -> None:
     http_errors = 0
     other_errors = 0
 
-    # Stream all records
-    for a in iter_epmc_all(args.query, page_size=args.page_size, sleep_s=args.sleep, session=session):
+    start_cursor = args.start_cursor if args.start_cursor else "*"
+
+    for a in iter_epmc_all(
+        args.query,
+        page_size=args.page_size,
+        sleep_s=args.sleep,
+        session=session,
+        timeout_s=args.timeout_search,
+        start_cursor=start_cursor,
+    ):
         streamed += 1
 
-        # Write every record to a JSONL manifest (so you always have the full set of IDs/metadata)
+        # Manifest (best effort)
         try:
             with manifest_path.open("a", encoding="utf-8") as mf:
                 mf.write(json.dumps(a.__dict__, ensure_ascii=False) + "\n")
-        except Exception as e:  # noqa: BLE001
-            log(f"Manifest write failed (continuing): {e}")
+        except Exception:
+            pass
 
-        # Real-time progress (streamed count updates constantly)
-        if streamed % 100 == 0:
-            log(f"Progress: streamed={streamed:,} | downloaded={downloaded:,} | skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} | skipped(already)={skipped_already:,}")
+        # Progress
+        if streamed % 1000 == 0:
+            log(
+                f"Progress: streamed={streamed:,} | downloaded={downloaded:,} | "
+                f"skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} | skipped(already)={skipped_already:,} | "
+                f"http_errors={http_errors:,} | other_errors={other_errors:,}"
+            )
 
-        # Only downloadable XML via this endpoint requires OA + PMCID
+        # Fallback resume mode: do nothing until we reach the requested starting count
+        if not args.start_cursor and args.skip_streamed and streamed < args.start_streamed:
+            continue
+
         if not (a.is_open_access and a.pmcid):
             skipped_no_pmcid_or_not_oa += 1
             continue
@@ -320,9 +362,8 @@ def main() -> None:
             skipped_already += 1
             continue
 
-        # Download full text
         try:
-            xml_bytes = fetch_fulltext_xml(a.pmcid, session=session)
+            xml_bytes = fetch_fulltext_xml(a.pmcid, session=session, timeout_s=args.timeout_fulltext)
             raw_xml_path = save_raw_xml(outdir, a.pmcid, xml_bytes)
 
             plain = jats_xml_to_text(xml_bytes)
@@ -338,7 +379,6 @@ def main() -> None:
             txt_path = save_text(outdir, a.pmcid, meta, plain)
 
             downloaded += 1
-            # Real-time per-download message
             log(f"Downloaded #{downloaded:,} (streamed={streamed:,}): {a.pmcid} | XML={raw_xml_path} | TXT={txt_path}")
 
             if args.max_downloads and downloaded >= args.max_downloads:
@@ -349,15 +389,26 @@ def main() -> None:
             http_errors += 1
             status = e.response.status_code if e.response is not None else "ERR"
             log(f"HTTP error for {a.pmcid}: {status} (continuing)")
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.Timeout,
+        ) as e:
+            other_errors += 1
+            log(f"Transient network error for {a.pmcid}: {type(e).__name__}: {e} (continuing)")
+            time.sleep(2.0)
         except Exception as e:  # noqa: BLE001
             other_errors += 1
             log(f"Error for {a.pmcid}: {e} (continuing)")
 
     log("Done.")
-    log(f"Totals: streamed={streamed:,} downloaded={downloaded:,} skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} skipped(already)={skipped_already:,} http_errors={http_errors:,} other_errors={other_errors:,}")
-    log(f"Manifest: {manifest_path}")
+    log(
+        f"Totals: streamed={streamed:,} downloaded={downloaded:,} "
+        f"skipped(no OA/PMCID)={skipped_no_pmcid_or_not_oa:,} skipped(already)={skipped_already:,} "
+        f"http_errors={http_errors:,} other_errors={other_errors:,}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
