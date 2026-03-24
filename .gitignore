@@ -20,6 +20,7 @@ scripts/test.py
 !.vscode/extensions.json
 
 
+AGO_REF_PDF/
 
 # Data & models
 artifacts/

@@ -160,7 +160,8 @@ def iter_scopus_search(
             if link.get("@ref") == "next" and link.get("@href"):
                 next_url = link["@href"]
                 break
-
+        if next_url:
+            log(f"Next URL: {next_url}")
         if sleep_s > 0:
             time.sleep(sleep_s)
 
