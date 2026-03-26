@@ -26,6 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 
@@ -42,16 +43,14 @@ CONFIG = {
     "COUNT": 200,                 # max allowed
     "SLEEP_SECONDS": 0.25,
 
-    # >>> NEW <<<
-    "START_STREAMED": 301700,    # restart from here (set to 0 for fresh run)
-    "MAX_STREAM": 0,             # 0 = unlimited
+    "START_STREAMED": 301700,     # restart from here (set to 0 for fresh run)
+    "MAX_STREAM": 0,              # 0 = unlimited
 
     "OUTDIR": "artifacts/elsevier",
     "LOG_PREFIX": "fetch_elsevier",
 
-    # >>> NEW <<<
-    "MAX_RETRIES": 6,            # for 5xx errors
-    "BACKOFF_BASE": 1.0,         # seconds
+    "MAX_RETRIES": 6,             # for 5xx errors
+    "BACKOFF_BASE": 1.0,          # seconds
 }
 
 
@@ -87,6 +86,33 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _repair_next_url_if_needed(next_url: str, query: str, count: int) -> str:
+    """
+    Some rare Scopus API responses return a malformed next link missing `query=...`
+    (e.g. .../search/scopus?cursor=XYZ). Scopus Search requires `query`.
+    If missing, we add it back (and count if missing) without changing anything else.
+    """
+    parsed = urlparse(next_url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+
+    changed = False
+
+    if "query" not in qs or not qs["query"] or not qs["query"][0]:
+        qs["query"] = [query]
+        changed = True
+
+    if "count" not in qs or not qs["count"] or not qs["count"][0]:
+        qs["count"] = [str(count)]
+        changed = True
+
+    if not changed:
+        return next_url
+
+    new_query = urlencode(qs, doseq=True)
+    repaired = urlunparse(parsed._replace(query=new_query))
+    return repaired
+
+
 # ======================================================================
 # Cursor-based Scopus Search (OFFICIAL METHOD + RETRIES)
 # ======================================================================
@@ -120,7 +146,7 @@ def iter_scopus_search(
         page += 1
         log(f"Fetching page {page}")
 
-        # >>> NEW: retry loop <<<
+        # retry loop for page fetch (5xx)
         for attempt in range(1, CONFIG["MAX_RETRIES"] + 1):
             try:
                 r = session.get(next_url, headers=headers, timeout=CONFIG["TIMEOUT"])
@@ -153,11 +179,16 @@ def iter_scopus_search(
         for e in entries:
             yield e
 
+        # Find next link EXACTLY as provided
         next_url = None
         for link in sr.get("link", []):
             if link.get("@ref") == "next" and link.get("@href"):
                 next_url = link["@href"]
                 break
+
+        # >>> FIX: ensure query is present in next_url (required by Scopus Search) <<<
+        if next_url:
+            next_url = _repair_next_url_if_needed(next_url, query=query, count=count)
 
         if sleep_s > 0:
             time.sleep(sleep_s)
@@ -226,7 +257,6 @@ def main() -> None:
     ):
         streamed += 1
 
-        # >>> NEW: restart logic <<<
         if streamed <= CONFIG["START_STREAMED"]:
             continue
 
