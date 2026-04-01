@@ -21,7 +21,7 @@ scripts/test.py
 
 ner_model/
 
-
+*out
 # Data & models
 artifacts/
 AGO_REF_PDF/

@@ -3,8 +3,8 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+
 import json
-import spacy
 import time
 import logging
 from pathlib import Path
@@ -14,14 +14,12 @@ from multiprocessing import Pool, cpu_count
 # -------------------------
 # CONFIG
 # -------------------------
-ner_nlp = None
+
 INPUT_DIR = "artifacts/epmc_fulltext/filtered_xml"
-OUTPUT_DIR = "artifacts/epmc_fulltext/ner"
+OUTPUT_DIR = "artifacts/epmc_fulltext/processed"
 
 MAX_FILES = 117602
-NUM_WORKERS = 20
-BATCH_SIZE = 100
-
+NUM_WORKERS = 12   # you can safely increase now (no heavy model)
 # -------------------------
 # LOGGING SETUP
 # -------------------------
@@ -39,16 +37,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# ============================================================
-# MODEL LOADER
-# ============================================================
-def init_worker():
-    global ner_nlp
-    ner_nlp = spacy.load("en_ner_bc5cdr_md")
-
-def load_model():
-    return spacy.load("en_ner_bc5cdr_md")
 
 # ============================================================
 # METADATA EXTRACTION
@@ -119,35 +107,11 @@ def extract_full_text(soup):
     return "\n".join(paragraphs)
 
 # ============================================================
-# NER (BATCHED)
-# ============================================================
-
-def perform_ner(full_text, ner_nlp, chunk_size=20000):
-    entities = []
-
-    chunks = [
-        full_text[i:i + chunk_size]
-        for i in range(0, len(full_text), chunk_size)
-    ]
-
-    for doc in ner_nlp.pipe(chunks, batch_size=BATCH_SIZE):
-        for ent in doc.ents:
-            entities.append({
-                "text": ent.text,
-                "label": ent.label_
-            })
-
-    return entities
-
-# ============================================================
 # PIPELINE
 # ============================================================
 
 def process_xml(file_path):
-    global ner_nlp
     try:
-        
-
         filename = os.path.basename(file_path)
         base = filename.replace(".xml", "")
 
@@ -157,20 +121,23 @@ def process_xml(file_path):
         metadata = extract_metadata(soup)
         full_text = extract_full_text(soup)
 
-        entities = perform_ner(full_text, ner_nlp)
-
         output = {
             "metadata": metadata,
-            "full_text": full_text,
-            "entities": entities
+            "full_text": full_text
         }
 
-        out_path = os.path.join(OUTPUT_DIR, f"{base}_ner.json")
+        out_path = os.path.join(OUTPUT_DIR, f"{base}.json")
 
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2)
+        # atomic write (safe for crashes)
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(output, f)
 
-        logging.info(f"{filename} → {len(entities)} entities")
+        os.replace(tmp_path, out_path)
+
+        # reduce logging overhead
+        if hash(filename) % 50 == 0:
+            logging.info(f"{filename} processed")
 
     except Exception as e:
         logging.error(f"Failed {file_path}: {e}")
@@ -190,11 +157,9 @@ def main():
 
         input_path = os.path.join(INPUT_DIR, f)
         base = f.replace(".xml", "")
-        output_path = os.path.join(OUTPUT_DIR, f"{base}_ner.json")
+        output_path = os.path.join(OUTPUT_DIR, f"{base}.json")
 
-        # skip already processed files
         if os.path.exists(output_path):
-            logging.info(f"Skipping {f} (already processed)")
             continue
 
         files.append(input_path)
@@ -206,18 +171,17 @@ def main():
 
     start_time = time.time()
 
-    with Pool(processes=NUM_WORKERS, initializer=init_worker) as pool:
+    with Pool(processes=NUM_WORKERS) as pool:
         pool.map(process_xml, files)
 
     end_time = time.time()
     total_time = end_time - start_time
 
-    num_files = len(files)
-    throughput = num_files / total_time if total_time > 0 else 0
+    throughput = len(files) / total_time if total_time > 0 else 0
 
     logging.info("========== PERFORMANCE ==========")
     logging.info(f"Total time: {total_time:.2f} seconds")
-    logging.info(f"Files processed: {num_files}")
+    logging.info(f"Files processed: {len(files)}")
     logging.info(f"Throughput: {throughput:.2f} files/sec")
     logging.info("=================================")
 
