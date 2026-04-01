@@ -19,7 +19,7 @@ scripts/test.py
 !.vscode/launch.json
 !.vscode/extensions.json
 
-
+ner_model/
 
 
 # Data & models
