@@ -12,6 +12,7 @@ scripts/test.py
 # Jupyter
 .ipynb_checkpoints/
 
+*.sh
 # VS Code
 .vscode/*.log
 !.vscode/settings.json
