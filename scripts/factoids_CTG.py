@@ -56,7 +56,7 @@ INPUT_DIR = Path("artifacts/CTG/filtered_studies")
 OUTPUT_DIR = Path("artifacts/CTG/factoids")
 LOG_DIR = Path("logs")
 
-MAX_FILES =6708
+MAX_FILES = 6708
 
 MODEL_NAME = "GPT-OSS-120B"
 MAX_COMPLETION_TOKENS = 4096
@@ -65,8 +65,8 @@ SLEEP = 0.2
 FACTOID_START = "<<<FACTOID>>>"
 FACTOID_END = "<<<END_FACTOID>>>"
 
-# If a study has huge text, keep prompts bounded.
-MAX_FIELD_CHARS = 12000
+# You asked to include only specific modules; keep prompts bounded anyway.
+MAX_FIELD_CHARS = 20000
 
 
 # -------------------------
@@ -150,9 +150,9 @@ def build_metadata_from_study(study: Dict[str, Any], input_file: Path) -> Dict[s
     ident = safe_get(study, ["protocolSection", "identificationModule"], default={}) or {}
     status = safe_get(study, ["protocolSection", "statusModule"], default={}) or {}
 
-    title = ident.get("briefTitle") or ident.get("officialTitle") or ident.get("nctId") or input_file.stem
+    # You asked to include officialTitle (not briefTitle)
+    title = ident.get("officialTitle") or ident.get("nctId") or input_file.stem
 
-    # Prefer the year from "studyFirstPostDateStruct.date" else last update else start date
     date_candidates = [
         safe_get(status, ["studyFirstPostDateStruct", "date"], default=None),
         safe_get(status, ["lastUpdatePostDateStruct", "date"], default=None),
@@ -178,113 +178,67 @@ def build_metadata_from_study(study: Dict[str, Any], input_file: Path) -> Dict[s
 
 def build_study_context_text(study: Dict[str, Any]) -> str:
     """
-    Build a compact, high-signal text payload for the LLM.
-    Keep it self-contained: include NCT, title, conditions, key design, interventions, outcomes, eligibility, status.
+    You requested to include ONLY these modules/fields:
+
+    - identificationModule.orgStudyIdInfo (id)
+    - identificationModule.officialTitle
+    - statusModule
+    - descriptionModule
+    - conditionsModule
+    - designModule
+    - armsInterventionsModule
+    - outcomesModule
+    - eligibilityModule
+    - identificationModule.briefTitle
+    - conditionsModule.keywords
+
+    EXCLUDE:
+    - referencesModule
+    - documentSection
+    - hasResults
     """
+
     proto = study.get("protocolSection") or {}
     ident = proto.get("identificationModule") or {}
     status = proto.get("statusModule") or {}
-    design = proto.get("designModule") or {}
     desc = proto.get("descriptionModule") or {}
     conds = proto.get("conditionsModule") or {}
+    design = proto.get("designModule") or {}
     arms = proto.get("armsInterventionsModule") or {}
     outs = proto.get("outcomesModule") or {}
     elig = proto.get("eligibilityModule") or {}
-    refs = proto.get("referencesModule") or {}
-    docs = study.get("documentSection") or {}
 
-    nct = ident.get("nctId") or ""
-    brief_title = ident.get("briefTitle") or ""
-    official_title = ident.get("officialTitle") or ""
-    org = (ident.get("organization") or {}).get("fullName") or ""
-
-    overall_status = status.get("overallStatus") or ""
-    why_stopped = status.get("whyStopped") or ""
-
-    conditions = conds.get("conditions") or []
-    keywords = conds.get("keywords") or []
-
-    study_type = design.get("studyType") or ""
-    phases = design.get("phases") or []
-    enrollment = (design.get("enrollmentInfo") or {})
-    design_info = design.get("designInfo") or {}
-
-    brief_summary = desc.get("briefSummary") or ""
-    detailed_description = desc.get("detailedDescription") or ""
-
-    interventions = arms.get("interventions") or []
-    arm_groups = arms.get("armGroups") or []
-
-    primary_outcomes = outs.get("primaryOutcomes") or []
-    secondary_outcomes = outs.get("secondaryOutcomes") or []
-
-    eligibility_criteria = elig.get("eligibilityCriteria") or ""
-    sex = elig.get("sex") or ""
-    min_age = elig.get("minimumAge") or ""
-    max_age = elig.get("maximumAge") or ""
-
-    has_results = study.get("hasResults", None)
-
-    # Keep references/doc metadata short; they can help the LLM avoid hallucinating
-    references = refs.get("references") or []
-    large_docs = safe_get(docs, ["largeDocumentModule", "largeDocs"], default=[]) or []
-
+    # Build a lean payload with only requested content.
     payload = {
-        "nctId": nct,
-        "briefTitle": brief_title,
-        "officialTitle": official_title,
-        "organization": org,
-        "status": {"overallStatus": overall_status, "whyStopped": why_stopped},
-        "conditions": conditions,
-        "keywords": keywords,
-        "design": {
-            "studyType": study_type,
-            "phases": phases,
-            "enrollmentInfo": enrollment,
-            "designInfo": design_info,
+        "identificationModule": {
+            "nctId": ident.get("nctId"),
+            "orgStudyIdInfo": ident.get("orgStudyIdInfo"),  # includes {"id": ...}
+            "officialTitle": ident.get("officialTitle"),
+            "briefTitle": ident.get("briefTitle"),
         },
-        "description": {
-            "briefSummary": clamp(brief_summary),
-            "detailedDescription": clamp(detailed_description),
+        "statusModule": status,
+        "descriptionModule": {
+            "briefSummary": clamp(desc.get("briefSummary")),
+            "detailedDescription": clamp(desc.get("detailedDescription")),
         },
-        "armsInterventions": {
-            "armGroups": arm_groups,
-            "interventions": interventions,
+        "conditionsModule": {
+            "conditions": conds.get("conditions"),
+            "keywords": conds.get("keywords"),
         },
-        "outcomes": {
-            "primaryOutcomes": primary_outcomes,
-            "secondaryOutcomes": secondary_outcomes,
+        "designModule": design,
+        "armsInterventionsModule": arms,
+        "outcomesModule": outs,
+        "eligibilityModule": {
+            # keep eligibility big but bounded
+            "sex": elig.get("sex"),
+            "minimumAge": elig.get("minimumAge"),
+            "maximumAge": elig.get("maximumAge"),
+            "stdAges": elig.get("stdAges"),
+            "healthyVolunteers": elig.get("healthyVolunteers"),
+            "eligibilityCriteria": clamp(elig.get("eligibilityCriteria")),
         },
-        "eligibility": {
-            "sex": sex,
-            "minimumAge": min_age,
-            "maximumAge": max_age,
-            "eligibilityCriteria": clamp(eligibility_criteria),
-        },
-        "hasResults": has_results,
-        "documents": [
-            {
-                "typeAbbrev": d.get("typeAbbrev"),
-                "label": d.get("label"),
-                "date": d.get("date"),
-                "filename": d.get("filename"),
-                "size": d.get("size"),
-            }
-            for d in large_docs[:20]
-            if isinstance(d, dict)
-        ],
-        "references": [
-            {
-                "type": r.get("type"),
-                "pmid": r.get("pmid"),
-                "citation": r.get("citation"),
-            }
-            for r in references[:20]
-            if isinstance(r, dict)
-        ],
     }
 
-    # Send as JSON string to keep structure crisp and reduce hallucination.
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -298,13 +252,10 @@ def build_prompts(metadata: Dict[str, Any], study_context: str) -> Tuple[str, st
         "Each factoid must be a single standalone statement that is understandable without context.\n"
         "Do NOT invent details. Use ONLY what is present in the provided study record.\n"
         "If a claim is not explicitly supported, do not include it.\n"
-        "Prefer factual statements about: disease/condition, intervention drug(s), study design, population, endpoints, eligibility, status, key dates, and whether results exist.\n"
-        "If the study is withdrawn/terminated/hasResults=false, include a clear factoid stating results are not posted / enrollment is zero if present.\n"
         "Avoid duplicates.\n"
         f"Use tags exactly:\n{FACTOID_START}\n...factoid...\n{FACTOID_END}\n"
     )
 
-    # Ensure self-sufficiency: include NCT and disease/drug terms in each statement when applicable.
     user = (
         "You are given a single ClinicalTrials.gov study record in JSON form.\n\n"
         "Task:\n"
@@ -312,20 +263,24 @@ def build_prompts(metadata: Dict[str, Any], study_context: str) -> Tuple[str, st
         "2) Extract self-sufficient factoids.\n\n"
         "Rules:\n"
         "- One factoid = one sentence.\n"
-        "- Each factoid should mention the condition/disease and (if relevant) the drug/intervention name.\n"
-        "- When stating design facts, include the study's NCT ID.\n"
-        "- Preserve numbers exactly (dates, enrollment counts, time frames).\n"
-        "- If there are NO drug interventions, you may still output design/status/eligibility factoids.\n"
+        "- Each factoid should be understandable with zero outside context.\n"
+        "- When you mention an intervention, state the disease/condition and the intervention name.\n"
+        "- When you mention design facts, include the study's NCT ID.\n"
+        "- Preserve numbers exactly (dates, enrollment counts, time frames, lab thresholds).\n"
         "- Do not output JSON. Do not number. Do not add commentary.\n"
         "- Output ONLY tagged factoids.\n\n"
         f"Metadata (for your awareness only):\n{json.dumps(metadata, ensure_ascii=False, indent=2)}\n\n"
-        f"Study record:\n{study_context}"
+        f"Study record (only selected modules are included):\n{study_context}"
     )
 
     return system, user
 
 
-def extract_factoids_from_study(client: OpenAI, metadata: Dict[str, Any], study_context: str) -> Tuple[List[str], Dict[str, int], str]:
+def extract_factoids_from_study(
+    client: OpenAI,
+    metadata: Dict[str, Any],
+    study_context: str,
+) -> Tuple[List[str], Dict[str, int], str]:
     system, user = build_prompts(metadata, study_context)
 
     resp = client.chat.completions.create(
@@ -369,7 +324,7 @@ def main() -> int:
     t0 = time.time()
     processed = 0
     written = 0
-    total_in_factoids = 0
+    total_factoids = 0
     tok_in = tok_out = tok_total = 0
 
     for f in files:
@@ -388,7 +343,7 @@ def main() -> int:
         study_context = build_study_context_text(study)
 
         try:
-            factoid_texts, usage, raw_llm_output = extract_factoids_from_study(client, metadata, study_context)
+            factoid_texts, usage, _raw = extract_factoids_from_study(client, metadata, study_context)
         except Exception as e:
             logger.error(f"LLM call failed for {f.name}: {e}")
             continue
@@ -397,7 +352,6 @@ def main() -> int:
         tok_out += usage.get("output_tokens", 0)
         tok_total += usage.get("total_tokens", 0)
 
-        # Build output object
         out_obj = {
             "metadata": {
                 "source_family": metadata.get("source_family"),
@@ -414,7 +368,7 @@ def main() -> int:
             json.dump(out_obj, out_f, ensure_ascii=False, indent=2)
 
         written += 1
-        total_in_factoids += len(factoid_texts)
+        total_factoids += len(factoid_texts)
 
         logger.info(
             f"Wrote: {out_path.name} | factoids={len(factoid_texts)} | "
@@ -428,7 +382,7 @@ def main() -> int:
     logger.info(f"Files selected:       {len(files)}")
     logger.info(f"Files processed:      {processed}")
     logger.info(f"Files written:        {written}")
-    logger.info(f"Total factoids:       {total_in_factoids}")
+    logger.info(f"Total factoids:       {total_factoids}")
     logger.info(f"Total time (sec):     {elapsed:.2f}")
     if elapsed > 0:
         logger.info(f"Throughput (files/s): {written/elapsed:.2f}")

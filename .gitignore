@@ -11,7 +11,7 @@ scripts/test.py
 
 # Jupyter
 .ipynb_checkpoints/
-
+*.csv
 *.sh
 # VS Code
 .vscode/*.log

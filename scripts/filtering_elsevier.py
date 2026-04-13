@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from openai import AsyncOpenAI
 
 
-INPUT_DIR = Path("artifacts/elsevier/non_duplicates")
+INPUT_DIR = Path("artifacts/elsevier/filtering_error")
 OUTPUT_DIR = Path("artifacts/elsevier/filtered_xml")
 REJECTED_DIR = Path("artifacts/elsevier/rejected_xml")
 FILTERING_ERROR_DIR = Path("artifacts/elsevier/filtering_error")
