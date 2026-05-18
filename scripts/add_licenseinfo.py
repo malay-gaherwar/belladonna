@@ -1,7 +1,7 @@
 from pathlib import Path
 import json
 
-ARTIFACTS_DIR = Path("/mnt/bulk-saturn/malaygaherwar/belladonna/artifacts")
+ARTIFACTS_DIR = Path("artifacts")
 
 TARGET_FOLDERS = ["AGO", "ASCO", "CTG", "EMA", "ESMO", "FDA"]
 

@@ -11,8 +11,8 @@ import chromadb
 from openai import OpenAI
 
 
-INPUT_DIR = Path("/mnt/bulk-saturn/malaygaherwar/belladonna/ASCO/factoids")
-OUTPUT_DIR = Path("/mnt/bulk-saturn/malaygaherwar/belladonna/ASCO/embeddings")
+INPUT_DIR = Path("artifacts/ASCO/factoids")
+OUTPUT_DIR = Path("artifacts/ASCO/embeddings")
 
 MAX_FILES = None  # Keep as None for all files
 
