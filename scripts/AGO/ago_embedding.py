@@ -12,8 +12,8 @@ from openai import OpenAI
 
 
 
-INPUT_DIR = Path("/mnt/bulk-saturn/malaygaherwar/belladonna/AGO_REF_PDF/factoid")
-OUTPUT_DIR = Path("/mnt/bulk-saturn/malaygaherwar/belladonna/AGO_REF_PDF/embeddings")
+INPUT_DIR = Path("artifacts/AGO/factoids")
+OUTPUT_DIR = Path("artifacts/AGO/embeddings")
 
 MAX_FILES = None  # Keep as None for all files
 

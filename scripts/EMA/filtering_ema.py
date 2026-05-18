@@ -3,7 +3,7 @@
 Classify EMA JSON datasets as breast-cancer-related or not using a local GPT-OSS model.
 
 Behavior:
-- Reads multiple EMA JSON files from artifacts/ema/downloaded
+- Reads multiple EMA JSON files from artifacts/EMA/downloaded
 - Extracts key fields for each record depending on source file
 - Sends the record information to a local OpenAI-compatible LLM
 - Expects YES or NO
@@ -35,8 +35,8 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 
-INPUT_DIR = Path("artifacts/ema/downloaded")
-OUTPUT_DIR = Path("artifacts/ema/filtered")
+INPUT_DIR = Path("artifacts/EMA/downloaded")
+OUTPUT_DIR = Path("artifacts/EMA/filtered")
 LOG_DIR = Path("logs")
 
 MODEL_NAME = "GPT-OSS-120B"

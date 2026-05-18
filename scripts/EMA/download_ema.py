@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-EMA_DIR = Path("artifacts/ema/downloaded")
+EMA_DIR = Path("artifacts/EMA/downloaded")
 
 EMA_FILES = [
     "medicines.json",

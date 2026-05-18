@@ -191,11 +191,12 @@ def build_study_context_text(study: Dict[str, Any]) -> str:
     - eligibilityModule
     - identificationModule.briefTitle
     - conditionsModule.keywords
+    - hasResults  (top-level results-posted flag; kept so factoids can state
+                   when a withdrawn/terminated trial has no posted results)
 
     EXCLUDE:
     - referencesModule
     - documentSection
-    - hasResults
     """
 
     proto = study.get("protocolSection") or {}
@@ -237,6 +238,9 @@ def build_study_context_text(study: Dict[str, Any]) -> str:
             "healthyVolunteers": elig.get("healthyVolunteers"),
             "eligibilityCriteria": clamp(elig.get("eligibilityCriteria")),
         },
+        # Top-level flag (sibling of protocolSection): whether results are
+        # posted on ClinicalTrials.gov. Useful for withdrawn/terminated trials.
+        "hasResults": study.get("hasResults"),
     }
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -267,6 +271,9 @@ def build_prompts(metadata: Dict[str, Any], study_context: str) -> Tuple[str, st
         "- When you mention an intervention, state the disease/condition and the intervention name.\n"
         "- When you mention design facts, include the study's NCT ID.\n"
         "- Preserve numbers exactly (dates, enrollment counts, time frames, lab thresholds).\n"
+        "- If the study is withdrawn/terminated or hasResults is false, include a "
+        "clear factoid stating that results are not posted (and that enrollment "
+        "is zero, if stated).\n"
         "- Do not output JSON. Do not number. Do not add commentary.\n"
         "- Output ONLY tagged factoids.\n\n"
         f"Metadata (for your awareness only):\n{json.dumps(metadata, ensure_ascii=False, indent=2)}\n\n"

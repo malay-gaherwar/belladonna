@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+from openai import OpenAI
+
+
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
 
 CSV_PATH = Path("bc_drugs_reference.csv")
 MERGED_DIR = Path("artifacts/fda/merged")
@@ -17,6 +24,16 @@ OUTPUT_DIR = Path("artifacts/fda/seed_from_csv")
 WRITE_JSONL = True
 WRITE_SUMMARY = True
 
+# LLM fallback for unresolved matches
+USE_LLM_FALLBACK = True
+MODEL_NAME = os.getenv("MODEL_NAME", "GPT-OSS-120B")
+MAX_COMPLETION_TOKENS = 300
+LLM_CANDIDATE_LIMIT = 20
+
+
+# -------------------------------------------------------------------
+# Basic helpers
+# -------------------------------------------------------------------
 
 def normalize_text(value: str) -> str:
     value = (value or "").lower().strip()
@@ -58,8 +75,24 @@ def read_json(path: Path) -> Any:
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        return [{k.strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+        return [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in reader]
 
+
+def join_label_field(label: dict[str, Any], key: str) -> str:
+    value = label.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [str(x).strip() for x in value if x is not None and str(x).strip()]
+        return "\n\n".join(parts)
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+# -------------------------------------------------------------------
+# Name handling
+# -------------------------------------------------------------------
 
 def gather_name_candidates(record: dict[str, Any]) -> set[str]:
     names: set[str] = set()
@@ -97,24 +130,62 @@ def gather_name_candidates(record: dict[str, Any]) -> set[str]:
     return {x for x in names if x}
 
 
-def join_label_field(label: dict[str, Any], key: str) -> str:
-    value = label.get(key)
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        parts = [str(x).strip() for x in value if x is not None and str(x).strip()]
-        return "\n\n".join(parts)
-    if isinstance(value, str):
-        return value.strip()
-    return str(value).strip()
+def csv_name_variants(name: str) -> list[str]:
+    variants: set[str] = set()
+    raw = (name or "").strip()
+    if not raw:
+        return []
 
+    variants.add(normalize_text(raw))
+
+    outer = re.sub(r"\(.*?\)", "", raw).strip()
+    if outer:
+        variants.add(normalize_text(outer))
+
+    for inner in re.findall(r"\((.*?)\)", raw):
+        inner = inner.strip()
+        if inner:
+            variants.add(normalize_text(inner))
+
+    synonym_map = {
+        "fluorouracil (5-fu)": ["fluorouracil", "5 fu", "5 fluorouracil"],
+        "t-dm1 (ado-trastuzumab emtansine)": [
+            "ado trastuzumab emtansine",
+            "trastuzumab emtansine",
+            "kadcyla",
+        ],
+        "t-dxd (trastuzumab deruxtecan)": [
+            "trastuzumab deruxtecan",
+            "fam trastuzumab deruxtecan nxki",
+            "enhertu",
+        ],
+        "eribulin": ["eribulin", "eribulin mesylate", "halaven"],
+        "pamidronate": ["pamidronate", "pamidronate disodium", "aredia"],
+        "tamoxifen": ["tamoxifen", "tamoxifen citrate", "nolvadex", "soltamox"],
+        "toremifene": ["toremifene", "toremifene citrate", "fareston"],
+        "vinblastine": ["vinblastine", "vinblastine sulfate"],
+        "epirubicin": ["epirubicin", "epirubicin hydrochloride", "ellence"],
+    }
+
+    key = normalize_text(raw)
+    for k, vals in synonym_map.items():
+        if key == normalize_text(k):
+            for v in vals:
+                variants.add(normalize_text(v))
+
+    return sorted(v for v in variants if v)
+
+
+# -------------------------------------------------------------------
+# Record building
+# -------------------------------------------------------------------
 
 def build_record(csv_row: dict[str, str], merged_record: dict[str, Any], merged_file_name: str) -> dict[str, Any]:
     metadata = merged_record.get("metadata") if isinstance(merged_record.get("metadata"), dict) else {}
     label = merged_record.get("label") if isinstance(merged_record.get("label"), dict) else {}
     openfda = label.get("openfda") if isinstance(label.get("openfda"), dict) else {}
 
-    brand_names = []
+    brand_names: list[str] = []
     seen = set()
     for source in [
         as_list(metadata.get("brand_name")),
@@ -206,8 +277,13 @@ def build_record(csv_row: dict[str, str], merged_record: dict[str, Any], merged_
     }
 
 
-def build_index(merged_dir: Path) -> tuple[dict[str, list[tuple[str, dict[str, Any]]]], int]:
-    index: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+# -------------------------------------------------------------------
+# Indexing
+# -------------------------------------------------------------------
+
+def build_index(merged_dir: Path) -> tuple[dict[str, list[tuple[str, dict[str, Any]]]], dict[str, tuple[str, dict[str, Any]]], int]:
+    name_index: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    file_index: dict[str, tuple[str, dict[str, Any]]] = {}
     total = 0
 
     for path in sorted(merged_dir.glob("*.json")):
@@ -217,35 +293,36 @@ def build_index(merged_dir: Path) -> tuple[dict[str, list[tuple[str, dict[str, A
         try:
             record = read_json(path)
         except Exception as exc:
-            print(f"[WARN] Could not parse {path.name}: {exc}")
+            print(f"[WARN] Could not parse {path.name}: {exc}", flush=True)
             continue
 
         if not isinstance(record, dict):
             continue
 
         total += 1
+        file_index[path.name] = (path.name, record)
+
         names = gather_name_candidates(record)
         for name in names:
-            index[name].append((path.name, record))
+            name_index[name].append((path.name, record))
 
         if total % 10000 == 0:
             print(f"[INDEX] processed {total} merged FDA records", flush=True)
 
-    return index, total
+    return name_index, file_index, total
 
 
 def choose_best_match(candidates: list[tuple[str, dict[str, Any]]], csv_generic_name: str) -> tuple[str, dict[str, Any]]:
-    target = normalize_text(csv_generic_name)
+    target_variants = set(csv_name_variants(csv_generic_name))
 
     def score(item: tuple[str, dict[str, Any]]) -> tuple[int, int, int, str]:
         file_name, record = item
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        label = record.get("label") if isinstance(record.get("label"), dict) else {}
+        label = record.get("label") if isinstance(label := record.get("label"), dict) else {}
         openfda = label.get("openfda") if isinstance(label.get("openfda"), dict) else {}
 
         names = gather_name_candidates(record)
-        exact = int(target in names)
-
+        exact = int(bool(target_variants & names))
         has_matched_metadata = int(record.get("metadata_link_status") == "matched")
         has_application = int(bool(first_nonempty(metadata.get("application_number"), openfda.get("application_number"))))
         label_date = first_nonempty(metadata.get("effective_time"), label.get("effective_time"))
@@ -255,6 +332,137 @@ def choose_best_match(candidates: list[tuple[str, dict[str, Any]]], csv_generic_
     return sorted(candidates, key=score, reverse=True)[0]
 
 
+# -------------------------------------------------------------------
+# LLM fallback
+# -------------------------------------------------------------------
+
+def get_client() -> Optional[OpenAI]:
+    api_key = os.getenv("VIRTUAL_API_KEY")
+    base_url = os.getenv("BASE_URL")
+
+    if not api_key or not base_url:
+        return None
+
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def build_candidate_summary(file_name: str, record: dict[str, Any]) -> dict[str, Any]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    label = record.get("label") if isinstance(record.get("label"), dict) else {}
+    openfda = label.get("openfda") if isinstance(label.get("openfda"), dict) else {}
+
+    return {
+        "file_name": file_name,
+        "generic_name": first_nonempty(metadata.get("generic_name"), openfda.get("generic_name")),
+        "brand_name": first_nonempty(metadata.get("brand_name"), openfda.get("brand_name")),
+        "substance_name": first_nonempty(metadata.get("substance_names"), openfda.get("substance_name")),
+        "active_ingredient": first_nonempty(label.get("active_ingredient")),
+        "application_number": first_nonempty(metadata.get("application_number"), openfda.get("application_number")),
+        "manufacturer_name": first_nonempty(metadata.get("manufacturer_name"), openfda.get("manufacturer_name")),
+        "indications_preview": join_label_field(label, "indications_and_usage")[:500],
+    }
+
+
+def llm_resolve_match(
+    client: OpenAI,
+    csv_row: dict[str, str],
+    candidate_items: list[tuple[str, dict[str, Any]]],
+) -> Optional[str]:
+    if not candidate_items:
+        return None
+
+    candidates_payload = [
+        build_candidate_summary(file_name, record)
+        for file_name, record in candidate_items[:LLM_CANDIDATE_LIMIT]
+    ]
+
+    prompt = {
+        "target_drug_from_csv": {
+            "generic_name": csv_row.get("generic_name", ""),
+            "drug_class": csv_row.get("drug_class", ""),
+            "notes": csv_row.get("notes", ""),
+        },
+        "candidate_fda_records": candidates_payload,
+        "task": (
+            "Choose the single candidate that refers to the same drug as the CSV target, "
+            "even if naming differs by shorthand, salt form, official FDA name, or brand name. "
+            "If none match, return null."
+        ),
+        "output_schema": {
+            "matched_file_name": "string or null",
+            "reason": "short string"
+        }
+    }
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        reasoning_effort="low",
+        max_completion_tokens=MAX_COMPLETION_TOKENS,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You resolve whether drug names refer to the same underlying drug. "
+                    "Use only the provided JSON. "
+                    "Be careful with shorthand names, aliases, salt forms, and brand/generic equivalents. "
+                    "Return valid JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(prompt, ensure_ascii=False, indent=2),
+            },
+        ],
+    )
+
+    content = (response.choices[0].message.content or "").strip()
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        return None
+
+    matched_file_name = parsed.get("matched_file_name")
+    if isinstance(matched_file_name, str) and matched_file_name.strip():
+        return matched_file_name.strip()
+
+    return None
+
+
+def collect_llm_candidates(
+    csv_generic_name: str,
+    name_index: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    variants = csv_name_variants(csv_generic_name)
+    tokens = set()
+    for v in variants:
+        tokens.update(v.split())
+
+    candidate_map: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    for key, items in name_index.items():
+        if not key:
+            continue
+
+        # token-overlap candidate gathering for unresolved cases
+        score = sum(1 for token in tokens if token in key)
+        if score > 0:
+            for file_name, record in items:
+                candidate_map[file_name] = (file_name, record)
+
+    ranked = []
+    for file_name, record in candidate_map.values():
+        names = gather_name_candidates(record)
+        score = max(sum(1 for token in tokens if token in n) for n in names) if names else 0
+        ranked.append((score, file_name, record))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [(file_name, record) for score, file_name, record in ranked[:LLM_CANDIDATE_LIMIT]]
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -263,17 +471,22 @@ def main() -> None:
     if not MERGED_DIR.exists():
         raise RuntimeError(f"Merged dir not found: {MERGED_DIR}")
 
+    client = get_client() if USE_LLM_FALLBACK else None
+    if USE_LLM_FALLBACK and client is None:
+        print("[WARN] LLM fallback enabled but VIRTUAL_API_KEY/BASE_URL missing; fallback disabled.", flush=True)
+
     print(f"Reading CSV: {CSV_PATH}", flush=True)
     csv_rows = read_csv_rows(CSV_PATH)
     print(f"CSV rows: {len(csv_rows)}", flush=True)
 
     print(f"Building merged FDA index from: {MERGED_DIR}", flush=True)
-    merged_index, merged_total = build_index(MERGED_DIR)
+    name_index, file_index, merged_total = build_index(MERGED_DIR)
     print(f"Merged FDA files indexed: {merged_total}", flush=True)
-    print(f"Unique normalized names indexed: {len(merged_index)}", flush=True)
+    print(f"Unique normalized names indexed: {len(name_index)}", flush=True)
 
     matched_rows = 0
     unmatched_rows = 0
+    llm_matched_rows = 0
     output_records: list[dict[str, Any]] = []
     unmatched: list[dict[str, Any]] = []
 
@@ -284,16 +497,43 @@ def main() -> None:
             unmatched.append({"csv_row": row, "reason": "missing_generic_name"})
             continue
 
-        key = normalize_text(csv_generic_name)
-        candidates = merged_index.get(key, [])
+        keys = csv_name_variants(csv_generic_name)
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        seen_files = set()
 
-        if not candidates:
+        for key in keys:
+            for item in name_index.get(key, []):
+                file_name, record = item
+                if file_name not in seen_files:
+                    seen_files.add(file_name)
+                    candidates.append(item)
+
+        matched_file_name: Optional[str] = None
+        matched_record: Optional[dict[str, Any]] = None
+        matched_via = "direct"
+
+        if candidates:
+            matched_file_name, matched_record = choose_best_match(candidates, csv_generic_name)
+        elif client is not None:
+            llm_candidates = collect_llm_candidates(csv_generic_name, name_index)
+            llm_choice = llm_resolve_match(client, row, llm_candidates)
+
+            if llm_choice and llm_choice in file_index:
+                matched_file_name, matched_record = file_index[llm_choice]
+                matched_via = "llm_fallback"
+
+        if matched_record is None or matched_file_name is None:
             unmatched_rows += 1
-            unmatched.append({"csv_row": row, "reason": "no_fda_match"})
-            print(f"[UNMATCHED] {csv_generic_name}", flush=True)
+            unmatched.append(
+                {
+                    "csv_row": row,
+                    "reason": "no_fda_match",
+                    "lookup_keys": keys,
+                }
+            )
+            print(f"[UNMATCHED] {csv_generic_name} | lookup_keys={keys}", flush=True)
             continue
 
-        matched_file_name, matched_record = choose_best_match(candidates, csv_generic_name)
         out_record = build_record(row, matched_record, matched_file_name)
         output_records.append(out_record)
 
@@ -306,7 +546,13 @@ def main() -> None:
             json.dump(out_record, f, ensure_ascii=False, indent=2)
 
         matched_rows += 1
-        print(f"[MATCHED] {i}/{len(csv_rows)} | {csv_generic_name} -> {matched_file_name}", flush=True)
+        if matched_via == "llm_fallback":
+            llm_matched_rows += 1
+
+        print(
+            f"[MATCHED] {i}/{len(csv_rows)} | {csv_generic_name} -> {matched_file_name} | via={matched_via}",
+            flush=True,
+        )
 
     if WRITE_JSONL:
         jsonl_path = OUTPUT_DIR / "belladonna_fda_seed.jsonl"
@@ -324,6 +570,7 @@ def main() -> None:
             "merged_fda_files_indexed": merged_total,
             "matched_rows": matched_rows,
             "unmatched_rows": unmatched_rows,
+            "llm_matched_rows": llm_matched_rows,
             "output_dir": str(OUTPUT_DIR),
         }
         with (OUTPUT_DIR / "summary.json").open("w", encoding="utf-8") as f:

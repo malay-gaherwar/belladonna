@@ -38,8 +38,8 @@ from openai import AsyncOpenAI
 # Config
 # -------------------------------------------------------------------
 
-INPUT_DIR = Path("artifacts/ema/filtered")
-OUTPUT_DIR = Path("artifacts/ema/factoids")
+INPUT_DIR = Path("artifacts/EMA/filtered")
+OUTPUT_DIR = Path("artifacts/EMA/factoids")
 LOG_DIR = Path("logs")
 
 MODEL_NAME = "GPT-OSS-120B"

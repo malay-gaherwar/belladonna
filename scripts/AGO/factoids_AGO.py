@@ -11,8 +11,8 @@ from typing import List, Dict, Any, Tuple
 
 from openai import OpenAI
 
-INPUT_DIR = Path("AGO_REF_PDF/output_md_llm/")
-OUTPUT_DIR = Path("AGO_REF_PDF/factoid/")
+INPUT_DIR = Path("artifacts/AGO/processed/")
+OUTPUT_DIR = Path("artifacts/AGO/factoids/")
 
 MODEL_NAME = "GPT-OSS-120B"
 MAX_COMPLETION_TOKENS = 4096

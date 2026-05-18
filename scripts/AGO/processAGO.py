@@ -13,8 +13,8 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from openai import OpenAI
 
-INPUT_DIR = Path("AGO_REF_PDF/E_REF_PDF")
-OUTPUT_DIR = Path("AGO_REF_PDF/output_md_llm")
+INPUT_DIR = Path("artifacts/AGO/downloaded")
+OUTPUT_DIR = Path("artifacts/AGO/processed")
 MAX_FILES = 25
 
 MODEL_NAME = "Qwen3.5-397B-A17B-FP8"

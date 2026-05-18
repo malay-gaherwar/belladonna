@@ -26,6 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -85,6 +86,33 @@ def extract_scopus_id(raw: Optional[str]) -> str:
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _repair_next_url_if_needed(next_url: str, query: str, count: int) -> str:
+    """
+    Some rare Scopus API responses return a malformed next link missing `query=...`
+    (e.g. .../search/scopus?cursor=XYZ). Scopus Search requires `query`.
+    If missing, we add it back (and count if missing) without changing anything else.
+    """
+    parsed = urlparse(next_url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+
+    changed = False
+
+    if "query" not in qs or not qs["query"] or not qs["query"][0]:
+        qs["query"] = [query]
+        changed = True
+
+    if "count" not in qs or not qs["count"] or not qs["count"][0]:
+        qs["count"] = [str(count)]
+        changed = True
+
+    if not changed:
+        return next_url
+
+    new_query = urlencode(qs, doseq=True)
+    repaired = urlunparse(parsed._replace(query=new_query))
+    return repaired
 
 
 # ======================================================================
@@ -161,6 +189,8 @@ def iter_scopus_search(
                 next_url = link["@href"]
                 break
         if next_url:
+            # Scopus occasionally drops `query=` from the next link; re-inject it.
+            next_url = _repair_next_url_if_needed(next_url, query=query, count=count)
             log(f"Next URL: {next_url}")
         if sleep_s > 0:
             time.sleep(sleep_s)
