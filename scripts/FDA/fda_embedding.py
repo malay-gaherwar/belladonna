@@ -200,13 +200,39 @@ def build_document_text(factoid: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def flatten_metadata(d: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts into Chroma-compatible scalars using FDA's
+    existing clean_metadata_value (lists become ' | '-joined strings,
+    dicts become JSON, None is dropped).
+    """
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}_{k}" if parent_key else k
+        if isinstance(v, dict):
+            flat.update(flatten_metadata(v, new_key))
+        else:
+            cleaned = clean_metadata_value(v)
+            if cleaned not in (None, ""):
+                flat[new_key] = cleaned
+    return flat
+
+
 def build_metadata(
     factoid: Dict[str, Any],
     record_id: str,
     index: int,
     payload_metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
+    # Carry every payload-level and factoid-level field forward. Existing
+    # explicit fields below win on any key collision so the downstream
+    # schema stays unchanged.
+    flat_payload = flatten_metadata(payload_metadata, parent_key="payload")
+    factoid_no_text = {k: v for k, v in factoid.items() if k != "factoid_text"}
+    flat_factoid = flatten_metadata(factoid_no_text)
+
     meta = {
+        **flat_payload,
+        **flat_factoid,
         "record_id": record_id,
         "factoid_id": clean_metadata_value(factoid.get("id")),
         "factoid_index": index,

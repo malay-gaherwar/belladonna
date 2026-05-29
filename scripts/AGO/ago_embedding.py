@@ -75,9 +75,30 @@ def build_factoid_id(file_name: str, local_id: int) -> str:
     return f"{Path(file_name).stem}_{local_id}"
 
 
+def flatten_metadata(d: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts so the result fits Chroma's metadata constraints
+    (values must be str/int/float/bool). Nested dicts get keys joined with
+    '_'; lists/other unsupported types are JSON-stringified; None is dropped.
+    """
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}_{k}" if parent_key else k
+        if isinstance(v, dict):
+            flat.update(flatten_metadata(v, new_key))
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float, bool)):
+            flat[new_key] = v
+        else:
+            flat[new_key] = json.dumps(v, ensure_ascii=False)
+    return flat
+
+
 def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     metadata = data.get("metadata", {})
     factoids = data.get("factoids", [])
+
+    flat_meta = flatten_metadata(metadata)
 
     rows = []
 
@@ -106,13 +127,9 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "document": text,
                 "embedding_text": embedding_text,
                 "metadata": {
-                            "factoid_id": factoid_id,
-                            "source_family": metadata.get("source_family"),
-                            "document_title": metadata.get("document_title"),
-                            "document_type": metadata.get("document_type"),
-                            "document_year": metadata.get("document_year"),
-                            "file_name": metadata.get("file_name"),
-                        
+                    **flat_meta,
+                    "factoid_id": factoid_id,
+                    "local_id": fid,
                 },
             }
         )

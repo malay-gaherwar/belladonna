@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from openai import OpenAI
 
 
-INPUT_DIR = Path("artifacts/EPMC/xml")
+INPUT_DIR = Path("artifacts/EPMC/filtered_xml")
 OUTPUT_JSON = Path("artifacts/EPMC/license_summary.json")
 
 # Set to an integer like 500 for testing.

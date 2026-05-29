@@ -81,12 +81,35 @@ def build_factoid_id(file_name: str, local_id: int) -> str:
     return f"{stem}_{local_id}"
 
 
+def flatten_metadata(d: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts to satisfy Chroma's scalar-metadata constraint.
+    Nested dicts get keys joined with '_'; lists/other non-scalars are
+    JSON-stringified; None values are dropped.
+    """
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}_{k}" if parent_key else k
+        if isinstance(v, dict):
+            flat.update(flatten_metadata(v, new_key))
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float, bool)):
+            flat[new_key] = v
+        else:
+            flat[new_key] = json.dumps(v, ensure_ascii=False)
+    return flat
+
+
 def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     metadata = data.get("metadata", {})
     factoids = data.get("factoids", [])
 
     rows: List[Dict[str, Any]] = []
 
+    flat_meta = flatten_metadata(metadata)
+
+    # Values used to build the embedding text — kept as explicit picks
+    # since the order matters for retrieval semantics.
     source_family = safe_str(metadata.get("source_family"))
     document_title = safe_str(metadata.get("document_title"))
     document_type = safe_str(metadata.get("document_type"))
@@ -115,13 +138,8 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         embedding_text = " | ".join(part for part in embedding_parts if part)
 
         row_metadata = {
+            **flat_meta,
             "factoid_id": factoid_id,
-            "source_family": source_family or None,
-            "document_title": document_title or None,
-            "document_type": document_type or None,
-            "document_year": document_year,
-            "file_name": file_name or None,
-            "source_pdf_name": source_pdf_name or None,
             "local_factoid_id": int(fid),
         }
 

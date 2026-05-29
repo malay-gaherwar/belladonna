@@ -11,8 +11,8 @@ import chromadb
 from openai import OpenAI
 
 
-INPUT_DIR = Path("artifacts/esmo/factoids")
-OUTPUT_DIR = Path("artifacts/esmo/embeddings")
+INPUT_DIR = Path("artifacts/ESMO/factoids")
+OUTPUT_DIR = Path("artifacts/ESMO/embeddings")
 
 MAX_FILES = None  # Keep as None for all files
 

@@ -12,8 +12,8 @@ import chromadb
 from openai import AsyncOpenAI
 
 
-INPUT_DIR = Path("artifacts/epmc_fulltext/factoids")
-OUTPUT_DIR = Path("artifacts/epmc_fulltext/embeddings")
+INPUT_DIR = Path("artifacts/EPMC/factoids")
+OUTPUT_DIR = Path("artifacts/EPMC/embeddings")
 
 MAX_FILES = None  # Keep as None for all files
 
@@ -88,6 +88,24 @@ def sanitize_metadata_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     return {str(k): sanitize_metadata_value(v) for k, v in d.items()}
 
 
+def pick_metadata(metadata: Dict[str, Any], *names: str) -> Any:
+    """Return the first non-empty value among `names`, case-insensitively.
+
+    EPMC factoid JSON has used inconsistent metadata key casing across
+    builds (e.g. TITLE vs document_title, DOI vs doi, YEAR vs
+    document_year). The Belladonna RAG reads fixed flat keys, so map
+    tolerantly here rather than assume one schema.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+    lowered = {str(k).lower(): v for k, v in metadata.items()}
+    for n in names:
+        v = lowered.get(n.lower())
+        if v not in (None, "", "None"):
+            return v
+    return ""
+
+
 def prepare_rows(data: Dict[str, Any], json_path: Path) -> List[Dict[str, Any]]:
     metadata = data.get("metadata", {}) or {}
     factoids = data.get("factoids", []) or []
@@ -127,9 +145,22 @@ def prepare_rows(data: Dict[str, Any], json_path: Path) -> List[Dict[str, Any]]:
             ] if x not in (None, "", "None")
         )
 
+        # Flat keys the Belladonna RAG retriever reads directly
+        # (belladonna_rag/retriever.py). These MUST mirror the other
+        # sources, e.g. scripts/AGO/ago_embedding.py — otherwise EPMC
+        # evidence shows blank title/year/DOI in the chatbot. The
+        # doc_/factoid_ prefixed copies below are kept for completeness.
         row_metadata: Dict[str, Any] = {
             "factoid_id": factoid_id,
             "source_json": json_path.name,
+            "source_family": pick_metadata(metadata, "source_family") or "EPMC",
+            "document_title": pick_metadata(metadata, "document_title", "title"),
+            "document_type": pick_metadata(metadata, "document_type"),
+            "document_year": pick_metadata(
+                metadata, "document_year", "year", "publication_year"),
+            "file_name": file_name,
+            "doi": pick_metadata(metadata, "doi"),
+            "source_pdf_name": pick_metadata(metadata, "source_pdf_name"),
         }
 
         for k, v in metadata.items():

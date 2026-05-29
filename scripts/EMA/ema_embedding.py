@@ -218,6 +218,22 @@ def build_embedding_text(
 # DATA PREP
 # ============================================================
 
+def flatten_metadata(d: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts to satisfy Chroma's scalar-metadata constraint."""
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}_{k}" if parent_key else k
+        if isinstance(v, dict):
+            flat.update(flatten_metadata(v, new_key))
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float, bool)):
+            flat[new_key] = v
+        else:
+            flat[new_key] = json.dumps(v, ensure_ascii=False)
+    return flat
+
+
 def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     top_metadata = data.get("metadata", {})
     factoids = data.get("factoids", [])
@@ -225,6 +241,11 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
     expanded_counter = 0
+
+    # Carry every top-level metadata field forward as a base layer; the
+    # explicit picks below override on key collision so the existing
+    # downstream schema (factoid_id, source_family, …) stays unchanged.
+    flat_top_meta = flatten_metadata(top_metadata)
 
     for item in factoids:
         if not isinstance(item, dict):
@@ -267,7 +288,10 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
 
             row_metadata = {
-                # -------- top-level file metadata --------
+                # -------- every top-level metadata field, flattened --------
+                **flat_top_meta,
+
+                # -------- top-level file metadata (explicit; overrides above on collision) --------
                 "factoid_id": factoid_id,
                 "source_family": clean_text(top_metadata.get("source_family")),
                 "document_title": clean_text(top_metadata.get("document_title")),

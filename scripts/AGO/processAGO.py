@@ -8,6 +8,7 @@ import inspect
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -21,6 +22,10 @@ MODEL_NAME = "Qwen3.5-397B-A17B-FP8"
 RENDER_DPI = 220
 MAX_COMPLETION_TOKENS = 4096
 SLEEP_BETWEEN_REQUESTS = 0.2
+
+# How many pages of a single PDF to transcribe concurrently. Kept small on
+# purpose so we don't hammer the API.
+MAX_WORKERS = 4
 
 
 def create_log_file() -> Path:
@@ -131,32 +136,46 @@ def extract_pdf_with_vision_llm(
     client: OpenAI,
     log_path: Path,
     dpi: int = 220,
+    max_workers: int = MAX_WORKERS,
 ) -> tuple[str, dict[str, int]]:
+    # Render all pages first (CPU-bound, fast) so the worker pool only
+    # does network-bound VLM calls.
     doc = fitz.open(pdf_path)
-    page_texts = []
-    total_usage = {"input": 0, "output": 0, "total": 0}
-
     try:
         total_pages = len(doc)
-
+        rendered: list[bytes] = []
         for page_index in range(total_pages):
-            page_num = page_index + 1
-            print(f"  Page {page_num}/{total_pages}")
-
             page = doc.load_page(page_index)
-            image_bytes = render_pdf_page_to_png_bytes(page, dpi=dpi)
+            rendered.append(render_pdf_page_to_png_bytes(page, dpi=dpi))
+    finally:
+        doc.close()
 
-            page_md, usage = transcribe_page_with_llm(
-                client=client,
-                image_bytes=image_bytes,
-                pdf_name=pdf_path.name,
-                page_num=page_num,
+    print(f"  {total_pages} pages, parallel workers={max_workers}", flush=True)
+
+    results: dict[int, tuple[str, dict[str, int]]] = {}
+
+    def transcribe_one(page_index: int) -> tuple[int, str, dict[str, int]]:
+        page_num = page_index + 1
+        page_md, usage = transcribe_page_with_llm(
+            client=client,
+            image_bytes=rendered[page_index],
+            pdf_name=pdf_path.name,
+            page_num=page_num,
+        )
+        return page_index, page_md, usage
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(transcribe_one, i) for i in range(total_pages)]
+        for fut in as_completed(futures):
+            page_index, page_md, usage = fut.result()
+            results[page_index] = (page_md, usage)
+            completed += 1
+            page_num = page_index + 1
+            print(
+                f"  Page {page_num} done ({completed}/{total_pages})",
+                flush=True,
             )
-
-            total_usage["input"] += usage["input_tokens"]
-            total_usage["output"] += usage["output_tokens"]
-            total_usage["total"] += usage["total_tokens"]
-
             append_log(
                 log_path,
                 f"  Page {page_num}/{total_pages}\n"
@@ -165,21 +184,28 @@ def extract_pdf_with_vision_llm(
                 f"    Total tokens: {usage['total_tokens']}\n\n",
             )
 
-            block = [
-                f"<!-- PAGE {page_num} START -->",
-                "",
-                f"## Page {page_num}",
-                "",
-                page_md,
-                "",
-                f"<!-- PAGE {page_num} END -->",
-            ]
-            page_texts.append("\n".join(block))
+    # Re-assemble in page order regardless of completion order.
+    total_usage = {"input": 0, "output": 0, "total": 0}
+    page_blocks: list[str] = []
+    for page_index in range(total_pages):
+        page_md, usage = results[page_index]
+        total_usage["input"] += usage["input_tokens"]
+        total_usage["output"] += usage["output_tokens"]
+        total_usage["total"] += usage["total_tokens"]
+        page_num = page_index + 1
+        block = [
+            f"<!-- PAGE {page_num} START -->",
+            "",
+            f"## Page {page_num}",
+            "",
+            page_md,
+            "",
+            f"<!-- PAGE {page_num} END -->",
+        ]
+        page_blocks.append("\n".join(block))
 
-            time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    finally:
-        doc.close()
+    # Light delay before moving on to the next PDF.
+    time.sleep(SLEEP_BETWEEN_REQUESTS)
 
     document_header = [
         f"# {pdf_path.stem}",
@@ -188,7 +214,7 @@ def extract_pdf_with_vision_llm(
         "",
     ]
 
-    full_markdown = "\n".join(document_header) + "\n\n" + "\n\n".join(page_texts)
+    full_markdown = "\n".join(document_header) + "\n\n" + "\n\n".join(page_blocks)
     return full_markdown, total_usage
 
 
@@ -219,6 +245,39 @@ def main() -> int:
         append_log(log_path, f"No PDF files found in {INPUT_DIR}\n")
         return 1
 
+    # Resume logic:
+    #   - Skip PDFs whose markdown already exists in OUTPUT_DIR.
+    #   - The most-recently-written markdown is treated as potentially
+    #     incomplete (the script may have been killed mid-write), so we
+    #     delete it and re-process its PDF from scratch.
+    existing_mds = sorted(OUTPUT_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime)
+    if existing_mds:
+        last_md = existing_mds[-1]
+        print(
+            f"Resume: removing last md to redo from scratch (kill-safety): "
+            f"{last_md.name}"
+        )
+        append_log(
+            log_path,
+            f"Resume: removing last md {last_md.name} (will reprocess)\n",
+        )
+        last_md.unlink()
+        existing_mds = existing_mds[:-1]
+
+    completed_stems = {p.stem for p in existing_mds}
+    skipped = [p for p in pdf_files if p.stem in completed_stems]
+    pdf_files = [p for p in pdf_files if p.stem not in completed_stems]
+
+    print(f"Resume: {len(skipped)} already done, {len(pdf_files)} to process")
+    append_log(
+        log_path,
+        f"Resume: {len(skipped)} skipped, {len(pdf_files)} to process\n",
+    )
+    if not pdf_files:
+        print("Nothing left to process.")
+        append_log(log_path, "Nothing left to process.\n")
+        return 0
+
     client = OpenAI(api_key=api_key, base_url=base_url)
     global_usage = {"input": 0, "output": 0, "total": 0}
 
@@ -226,7 +285,8 @@ def main() -> int:
     append_log(log_path, f"Output directory: {OUTPUT_DIR}\n")
     append_log(log_path, f"Model: {MODEL_NAME}\n")
     append_log(log_path, f"Render DPI: {RENDER_DPI}\n")
-    append_log(log_path, f"Max files: {MAX_FILES}\n\n")
+    append_log(log_path, f"Max files: {MAX_FILES}\n")
+    append_log(log_path, f"Parallel workers per PDF: {MAX_WORKERS}\n\n")
 
     for pdf_file in pdf_files:
         print(f"Processing: {pdf_file.name}")

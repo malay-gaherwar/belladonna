@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -18,8 +19,17 @@ MODEL_NAME = "GPT-OSS-120B"
 MAX_COMPLETION_TOKENS = 4096
 SLEEP = 0.2
 
+# Pages of a single md transcribed in parallel. Kept small on purpose.
+MAX_WORKERS = 4
+
 FACTOID_START = "<<<FACTOID>>>"
 FACTOID_END = "<<<END_FACTOID>>>"
+
+AGO_LICENSE_INFO = {
+    "copyright": "German Copyright law",
+    "commercial_use": "no",
+    "personal_use": "yes",
+}
 
 PAGE_PATTERN = re.compile(
     r"<!-- PAGE (\d+) START -->(.*?)<!-- PAGE \1 END -->",
@@ -104,6 +114,7 @@ def build_metadata(input_file: Path) -> Dict[str, Any]:
         "document_type": "Guidelines",
         "document_year": year,
         "file_name": input_file.name,
+        "license_info": AGO_LICENSE_INFO,
     }
 
 
@@ -182,14 +193,49 @@ def extract_factoids_from_page(
     return blocks, usage_dict
 
 
-def process_one_file(client: OpenAI, input_file: Path) -> None:
+def process_one_file(
+    client: OpenAI,
+    input_file: Path,
+    file_idx: int | None = None,
+    file_total: int | None = None,
+) -> None:
     md_text = input_file.read_text(encoding="utf-8")
     pages = parse_pages(md_text)
     metadata = build_metadata(input_file)
 
-    print(f"\nProcessing: {input_file.name}")
-    print(f"Pages detected: {len(pages)}")
+    tag = f"[{file_idx}/{file_total}] " if file_idx and file_total else ""
+    print(f"\n=== {tag}File: {input_file.name} ===", flush=True)
+    print(f"Pages detected: {len(pages)}, parallel workers={MAX_WORKERS}", flush=True)
 
+    # Run all pages in parallel; collect results keyed by list index so we
+    # can reassemble in deterministic page order afterwards.
+    results: Dict[int, Tuple[List[str], Dict[str, int]]] = {}
+
+    def transcribe_one(idx: int) -> Tuple[int, List[str], Dict[str, int]]:
+        page = pages[idx]
+        blocks, usage = extract_factoids_from_page(
+            client=client,
+            page_num=page["page_num"],
+            heading=page["heading"],
+            page_content=page["content"],
+        )
+        return idx, blocks, usage
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(transcribe_one, i) for i in range(len(pages))]
+        for fut in as_completed(futures):
+            idx, blocks, usage = fut.result()
+            results[idx] = (blocks, usage)
+            completed += 1
+            page_num = pages[idx]["page_num"]
+            print(
+                f"  {tag}Page {page_num} done ({completed}/{len(pages)})",
+                flush=True,
+            )
+
+    # Re-assemble in original page order so factoid dedup is deterministic
+    # (first occurrence — the earliest page — wins).
     factoids: List[str] = []
     seen = set()
 
@@ -202,19 +248,9 @@ def process_one_file(client: OpenAI, input_file: Path) -> None:
     log_lines.append(f"Pages detected: {len(pages)}")
     log_lines.append("")
 
-    for idx, page in enumerate(pages, 1):
-        page_num = page["page_num"]
-        heading = page["heading"]
-        content = page["content"]
-
-        print(f"Page {idx}/{len(pages)} (page {page_num})")
-
-        blocks, usage = extract_factoids_from_page(
-            client=client,
-            page_num=page_num,
-            heading=heading,
-            page_content=content,
-        )
+    for idx in range(len(pages)):
+        page = pages[idx]
+        blocks, usage = results[idx]
 
         total_input_tokens += usage["input_tokens"]
         total_output_tokens += usage["output_tokens"]
@@ -227,15 +263,18 @@ def process_one_file(client: OpenAI, input_file: Path) -> None:
                 factoids.append(b)
         added_count = len(factoids) - before_count
 
-        log_lines.append(f"Page {page_num}")
-        log_lines.append(f"Heading: {heading if heading else '[no heading]'}")
+        log_lines.append(f"Page {page['page_num']}")
+        log_lines.append(
+            f"Heading: {page['heading'] if page['heading'] else '[no heading]'}"
+        )
         log_lines.append(f"Input tokens: {usage['input_tokens']}")
         log_lines.append(f"Output tokens: {usage['output_tokens']}")
         log_lines.append(f"Total tokens: {usage['total_tokens']}")
         log_lines.append(f"Factoids added: {added_count}")
         log_lines.append("")
 
-        time.sleep(SLEEP)
+    # Brief delay before moving on to the next file.
+    time.sleep(SLEEP)
 
     output = {
         "metadata": metadata,
@@ -276,9 +315,14 @@ def main():
     input_files = pick_md_files()
     print(f"Found {len(input_files)} markdown files.")
 
-    for input_file in input_files:
+    for i, input_file in enumerate(input_files, 1):
         try:
-            process_one_file(client, input_file)
+            process_one_file(
+                client,
+                input_file,
+                file_idx=i,
+                file_total=len(input_files),
+            )
         except Exception as e:
             print(f"Failed on {input_file.name}: {e}")
 

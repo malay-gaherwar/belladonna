@@ -78,9 +78,28 @@ def build_factoid_id(file_name: str, local_id: int) -> str:
     return f"{Path(file_name).stem}_{local_id}"
 
 
+def flatten_metadata(d: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts to satisfy Chroma's scalar-metadata constraint.
+    Nested dicts get keys joined with '_'; lists/other non-scalars are
+    JSON-stringified; None values are dropped.
+    """
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}_{k}" if parent_key else k
+        if isinstance(v, dict):
+            flat.update(flatten_metadata(v, new_key))
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float, bool)):
+            flat[new_key] = v
+        else:
+            flat[new_key] = json.dumps(v, ensure_ascii=False)
+    return flat
+
+
 def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    CTG factoids file shape (example): :contentReference[oaicite:0]{index=0}
+    CTG factoids file shape (example):
 
     {
       "metadata": {
@@ -88,12 +107,10 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         "document_title": "...",
         "document_type": "Clinical Trials",
         "document_year": 2003,
-        "file_name": "0000007_NCT00005886.json"
+        "file_name": "0000007_NCT00005886.json",
+        "license_info": {"copyright": "...", "commercial_use": "yes", ...}
       },
-      "factoids": [
-        {"id": 1, "factoid_text": "..."},
-        ...
-      ]
+      "factoids": [{"id": 1, "factoid_text": "..."}, ...]
     }
     """
     metadata = data.get("metadata", {}) or {}
@@ -101,8 +118,9 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
 
-    # carry all metadata keys forward (future-proof)
-    base_meta = dict(metadata)
+    # Flatten once per file: nested dicts (license_info, …) become keys
+    # like license_info_copyright. Required so Chroma accepts the metadata.
+    flat_meta = flatten_metadata(metadata)
 
     for item in factoids:
         fid = item.get("id")
@@ -110,23 +128,23 @@ def prepare_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not fid or not text:
             continue
 
-        factoid_id = build_factoid_id(base_meta.get("file_name", "unknown"), int(fid))
+        factoid_id = build_factoid_id(metadata.get("file_name", "unknown"), int(fid))
 
         # Embedding text: include ALL metadata fields (as key=value) + factoid text.
-        # This helps retrieval by title/year/type/etc.
         meta_kv = []
-        for k in sorted(base_meta.keys()):
-            v = base_meta.get(k)
-            if v is None or v == "" or v == "None":
+        for k in sorted(flat_meta.keys()):
+            v = flat_meta[k]
+            if v in (None, "", "None"):
                 continue
             meta_kv.append(f"{k}={v}")
 
         embedding_text = " | ".join(meta_kv + [text])
 
-        # Store everything in Chroma metadata too (plus factoid_id)
-        chroma_meta = dict(base_meta)
-        chroma_meta["factoid_id"] = factoid_id
-        chroma_meta["local_factoid_id"] = int(fid)
+        chroma_meta = {
+            **flat_meta,
+            "factoid_id": factoid_id,
+            "local_factoid_id": int(fid),
+        }
 
         rows.append(
             {

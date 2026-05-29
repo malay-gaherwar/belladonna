@@ -3,120 +3,121 @@ import json
 
 ARTIFACTS_DIR = Path("artifacts")
 
-TARGET_FOLDERS = ["AGO", "ASCO", "CTG", "EMA", "ESMO", "FDA"]
-
-LICENSE_BY_FOLDER = {
-    "AGO": {"commercial": "not_allowed", "research": "allowed"},
-    "ASCO": {"commercial": "not_allowed", "research": "allowed"},
-    "ESMO": {"commercial": "not_allowed", "research": "allowed"},
-    "FDA": {"commercial": "allowed", "research": "allowed"},
-    "EMA": {"commercial": "allowed", "research": "allowed"},
-    "CTG": {"commercial": "allowed", "research": "allowed"},
+LICENSE_INFO_BY_FOLDER = {
+    "ASCO": {
+        "copyright": "ASCO copyright",
+        "commercial_use": "no",
+        "personal_use": "yes",
+    },
+    "ESMO": {
+        "copyright": "ESMO copyright",
+        "commercial_use": "no",
+        "personal_use": "yes",
+    },
+    "EMA": {
+        "copyright": "EMA / EU public sector information",
+        "commercial_use": "yes",
+        "personal_use": "yes",
+    },
+    "FDA": {
+        "copyright": "U.S. Government work, public domain",
+        "commercial_use": "yes",
+        "personal_use": "yes",
+    },
+    "CTG": {
+        "copyright": "U.S. Government work, public domain (ClinicalTrials.gov)",
+        "commercial_use": "yes",
+        "personal_use": "yes",
+    },
 }
 
-# Safety switch: only AGO is actually modified for now.
-WRITE_ENABLED_FOLDERS = {"AGO"}
+# If True, overwrite metadata["license_info"] even when it already exists.
+FORCE_REWRITE = False
 
 
-def add_license_label(json_path: Path, license_label: dict) -> bool:
+def add_license_info(json_path: Path, license_info: dict) -> str:
     with json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     if not isinstance(data, dict):
-        print(f"[SKIP] Not a JSON object: {json_path}")
-        return False
+        return "skipped_not_object"
 
     metadata = data.setdefault("metadata", {})
     if not isinstance(metadata, dict):
-        print(f"[SKIP] metadata is not an object: {json_path}")
-        return False
+        return "skipped_bad_metadata"
 
-    before = metadata.get("license_label")
+    existing = metadata.get("license_info")
+    if existing == license_info and not FORCE_REWRITE:
+        return "unchanged"
+    if existing is not None and not FORCE_REWRITE:
+        return "skipped_already_present"
 
-    metadata["license_label"] = {
-        "commercial": license_label["commercial"],
-        "research": license_label["research"],
-    }
+    metadata["license_info"] = dict(license_info)
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
 
-    return before != metadata["license_label"]
+    return "updated"
 
 
-def main():
-    stats = {
-        "folders_seen": 0,
-        "folders_missing": 0,
-        "factoids_dirs_missing": 0,
-        "files_seen": 0,
-        "files_modified": 0,
-        "files_already_correct": 0,
-        "files_debug_only": 0,
-        "files_failed": 0,
-    }
-
+def main() -> None:
     print(f"[START] Artifacts dir: {ARTIFACTS_DIR}")
-    print(f"[START] Write-enabled folders: {sorted(WRITE_ENABLED_FOLDERS)}")
+    print(f"[START] Force rewrite: {FORCE_REWRITE}")
     print()
 
-    for folder_name in TARGET_FOLDERS:
+    totals = {
+        "updated": 0,
+        "unchanged": 0,
+        "skipped_already_present": 0,
+        "skipped_not_object": 0,
+        "skipped_bad_metadata": 0,
+        "errors": 0,
+    }
+
+    for folder_name, license_info in LICENSE_INFO_BY_FOLDER.items():
         folder = ARTIFACTS_DIR / folder_name
-        factoids_dir = folder / "factoid"
+        factoids_dir = folder / "factoids"
 
-        print(f"[FOLDER] {folder_name}")
-
-        if not folder.is_dir():
-            stats["folders_missing"] += 1
-            print(f"  [MISSING] Folder does not exist: {folder}")
-            continue
-
-        stats["folders_seen"] += 1
+        print(f"[FOLDER] {folder_name}  ->  license_info = {license_info}")
 
         if not factoids_dir.is_dir():
-            stats["factoids_dirs_missing"] += 1
-            print(f"  [MISSING] factoids dir does not exist: {factoids_dir}")
-            continue
-
-        license_label = LICENSE_BY_FOLDER[folder_name]
-        json_files = sorted(factoids_dir.rglob("*.json"))
-
-        print(f"  [INFO] factoids dir: {factoids_dir}")
-        print(f"  [INFO] JSON files found: {len(json_files)}")
-        print(f"  [INFO] license_label would be: {license_label}")
-
-        if folder_name not in WRITE_ENABLED_FOLDERS:
-            stats["files_debug_only"] += len(json_files)
-            for path in json_files[:5]:
-                print(f"  [DEBUG ONLY] Would update: {path}")
-            if len(json_files) > 5:
-                print(f"  [DEBUG ONLY] ... plus {len(json_files) - 5} more files")
+            print(f"  [MISSING] {factoids_dir}")
             print()
             continue
 
-        for json_path in json_files:
-            stats["files_seen"] += 1
-            try:
-                changed = add_license_label(json_path, license_label)
-                if changed:
-                    stats["files_modified"] += 1
-                    print(f"  [UPDATED] {json_path}")
-                else:
-                    stats["files_already_correct"] += 1
-                    print(f"  [UNCHANGED] Already correct: {json_path}")
-            except Exception as e:
-                stats["files_failed"] += 1
-                print(f"  [FAILED] {json_path}: {e}")
+        json_files = sorted(factoids_dir.glob("*.json"))
+        print(f"  [INFO] JSON files: {len(json_files)}")
 
+        per_folder = {k: 0 for k in totals}
+
+        for i, json_path in enumerate(json_files, start=1):
+            try:
+                status = add_license_info(json_path, license_info)
+            except Exception as e:
+                per_folder["errors"] += 1
+                totals["errors"] += 1
+                print(f"  [ERROR] {json_path.name}: {e}")
+                continue
+
+            per_folder[status] = per_folder.get(status, 0) + 1
+            totals[status] = totals.get(status, 0) + 1
+
+            if i % 1000 == 0:
+                print(
+                    f"  Processed {i}/{len(json_files)} | "
+                    f"updated={per_folder['updated']} "
+                    f"already_present={per_folder['skipped_already_present']} "
+                    f"unchanged={per_folder['unchanged']} "
+                    f"errors={per_folder['errors']}"
+                )
+
+        print(f"  [DONE {folder_name}] {per_folder}")
         print()
 
     print("[SUMMARY]")
-    for key, value in stats.items():
+    for key, value in totals.items():
         print(f"  {key}: {value}")
-
-    print()
-    print("[DONE] Only AGO was modified. Other folders were debug-only.")
 
 
 if __name__ == "__main__":
