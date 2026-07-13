@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+openai>=1.40
+httpx>=0.27
+numpy>=1.26
+
+# Vector backends. Both are listed because the app dispatches at runtime
+# via BELLADONNA_VECTOR_BACKEND. Production uses qdrant-client only, but
+# keeping chromadb installed lets ops fall back without redeploying.
+chromadb>=1.3
+qdrant-client>=1.13

@@ -1,0 +1,52 @@
+version: "3.8"
+
+# Production deployment of BELLADONNA RAG. One Qdrant container holds the
+# 1024-dim INT8-quantized vector index for all sources; the FastAPI app is
+# run separately (uvicorn, systemd, or another container — your choice).
+#
+# Memory footprint on an 8 GB box, all 7 sources loaded:
+#   Qdrant       ~3-4 GB resident (INT8 vectors + HNSW graph in RAM)
+#   FastAPI app  ~0.5 GB
+#   OS + cache   ~1 GB
+#   Headroom    ~2.5 GB
+#
+# Start:
+#     docker compose -f deploy/docker-compose.yml up -d
+#
+# Shut down:
+#     docker compose -f deploy/docker-compose.yml down
+#
+# The Qdrant data volume MUST be populated before first start. See
+# DEPLOYMENT.md for the seeding procedure (rsync from the research box).
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15.1
+    container_name: belladonna-qdrant
+    restart: unless-stopped
+    # Only expose to localhost; the FastAPI app on the same box reaches
+    # this via 127.0.0.1:6333. Do NOT publish to 0.0.0.0 — Qdrant has no
+    # auth on the open-source build.
+    ports:
+      - "127.0.0.1:6333:6333"   # HTTP / REST
+      - "127.0.0.1:6334:6334"   # gRPC
+    volumes:
+      # Persistent index storage. Mount the directory that was rsync'd
+      # from the research box (contains collections/, raft_state.json,
+      # etc. — DO NOT replace with an empty dir).
+      - ./qdrant_storage:/qdrant/storage
+    environment:
+      # Cap thread pool and the optimizer's memory ceiling on the 8 GB box.
+      QDRANT__SERVICE__MAX_REQUEST_SIZE_MB: "256"
+      QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD_KB: "200000"
+    deploy:
+      resources:
+        limits:
+          # Hard memory cap so a runaway optimizer can't OOM the host.
+          memory: 6G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6333/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
