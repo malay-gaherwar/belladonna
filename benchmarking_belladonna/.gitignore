@@ -1,0 +1,11 @@
+# Never commit benchmark data / answer keys to this public repo
+results/
+results_direct/
+results_qdrant_baseline/
+compare/
+compare_direct/
+dashboard/
+*_question*.json
+GPT-OSS_RAG_failures.md
+__pycache__/
+*.pyc
