@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BELLADONNA Factoid Atlas — color scheme preview</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#161a22; --ink:#e7ecf3; --muted:#9aa6b6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:Inter,system-ui,"Segoe UI",Roboto,sans-serif; padding:32px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 28px; font-size:.92rem; max-width:780px; line-height:1.5; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:22px; }
+  .dim { background:var(--panel); border:1px solid #232a36; border-radius:14px; padding:18px 18px 8px; }
+  .dim h2 { font-size:1rem; margin:0 0 2px; }
+  .dim .hint { color:var(--muted); font-size:.78rem; margin:0 0 14px; }
+  .row { display:flex; align-items:center; gap:11px; padding:5px 0; }
+  .dot { width:18px; height:18px; border-radius:50%; flex:none;
+         box-shadow:0 0 0 1px rgba(255,255,255,.12), 0 0 10px -2px currentColor; }
+  .nm { font-size:.86rem; }
+  .code { color:var(--muted); font-size:.72rem; margin-left:auto; font-family:ui-monospace,monospace; }
+  /* a tiny mock "atlas" so you can see the dots on a dark scatter */
+  .mock { margin-top:26px; }
+  canvas { width:100%; height:200px; background:#080a0e; border-radius:12px; border:1px solid #232a36; display:block; }
+  footer { color:var(--muted); font-size:.76rem; margin-top:26px; line-height:1.5; }
+</style>
+</head>
+<body>
+  <h1>Factoid Atlas — clinical color-coding scheme</h1>
+  <p class="sub">Four toggleable color modes for the per-factoid embedding atlas. Each factoid (one dot) gets
+  one label per dimension from GPT-OSS-120B. <b>“none”</b> is rendered in neutral grey so off-topic factoids
+  recede. Colors are tuned for the near-black atlas background. This page is a static preview of
+  <code>taxonomy.py</code> — react and I'll tweak hues/labels before any classification runs.</p>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="mock">
+    <canvas id="mock" width="1200" height="200"></canvas>
+  </div>
+
+  <footer>
+    Drug-class buckets are grown from the team's <code>bc_drugs_reference.csv</code> + the <code>drug_class</code>
+    field already on FDA factoids. Biomarker / setting / evidence axes are designed for breast oncology.
+    Each dimension ≤ 13 labels → fits one byte in <code>attrs.bin</code>, alongside source &amp; year.
+  </footer>
+
+<script>
+const TAX = {
+  "Drug class": {
+    hint: "therapeutic class of the primary drug discussed",
+    labels: [
+      ["Not drug-specific","none","#3a3f4b"],
+      ["Endocrine therapy","endocrine","#2a9d8f"],
+      ["CDK4/6 inhibitor","cdk46","#e8177f"],
+      ["PI3K / AKT / mTOR inh.","pi3k_mtor","#9b5de5"],
+      ["PARP inhibitor","parp","#5161d6"],
+      ["Anti-HER2 antibody","her2_mab","#3a86ff"],
+      ["Antibody-drug conjugate","adc","#00b4d8"],
+      ["HER2 / EGFR TKI","her2_tki","#48cae4"],
+      ["Immunotherapy","immuno","#52b788"],
+      ["Chemotherapy","chemo","#f4a261"],
+      ["Anti-angiogenic","antiangiogenic","#bc6c25"],
+      ["Bone-modifying agent","bone","#a47148"],
+      ["Other / supportive drug","other_drug","#8d99ae"],
+    ]
+  },
+  "Biomarker / molecular": {
+    hint: "molecular context / receptor status",
+    labels: [
+      ["No specific biomarker","none","#3a3f4b"],
+      ["HER2-positive","her2_pos","#3a86ff"],
+      ["HER2-low / ultralow","her2_low","#90caf9"],
+      ["HR+ / ER+ (luminal)","hr_pos","#2a9d8f"],
+      ["Triple-negative","tnbc","#e63946"],
+      ["BRCA / germline / HRD","brca_hrd","#9b5de5"],
+      ["PIK3CA / AKT / PTEN","pik3ca","#c77dff"],
+      ["ESR1 mutation","esr1","#ff6ec7"],
+      ["PD-L1 / immune / TILs","pdl1","#52b788"],
+      ["Ki-67 / grade","proliferation","#f4a261"],
+      ["Genomic assay","genomic_assay","#ffd166"],
+      ["Other biomarker","other_biomarker","#8d99ae"],
+    ]
+  },
+  "Disease setting": {
+    hint: "clinical stage / line / care setting",
+    labels: [
+      ["Not setting-specific","none","#3a3f4b"],
+      ["Prevention / risk-reduce","prevention","#52b788"],
+      ["Screening / diagnosis","screening_dx","#2a9d8f"],
+      ["Neoadjuvant","neoadjuvant","#f4a261"],
+      ["Adjuvant / early","adjuvant_early","#3a86ff"],
+      ["Surgery / radiation","locoregional","#a47148"],
+      ["Metastatic / advanced","metastatic","#e63946"],
+      ["CNS / brain mets","cns","#ff6ec7"],
+      ["Follow-up / survivorship","survivorship","#90caf9"],
+      ["Supportive care","supportive","#ffd166"],
+      ["Special populations","special_pop","#9b5de5"],
+    ]
+  },
+  "Evidence / theme": {
+    hint: "what KIND of statement the factoid is",
+    labels: [
+      ["Definition / background","background_def","#3a3f4b"],
+      ["RCT result","rct","#3a86ff"],
+      ["Meta-analysis / SR","meta_sr","#5161d6"],
+      ["Guideline recommendation","guideline","#2a9d8f"],
+      ["Regulatory / label","regulatory","#f4a261"],
+      ["Real-world / observational","observational","#ffd166"],
+      ["Mechanism / biology","mechanism","#9b5de5"],
+      ["Epidemiology / prognosis","epidemiology","#52b788"],
+      ["Diagnostic method","diagnostic_method","#00b4d8"],
+      ["Safety / QoL","safety_qol","#e63946"],
+    ]
+  },
+};
+
+const grid = document.getElementById('grid');
+const allColors = [];
+for (const [title, dim] of Object.entries(TAX)) {
+  const el = document.createElement('div'); el.className = 'dim';
+  el.innerHTML = `<h2>${title}</h2><p class="hint">${dim.hint}</p>` +
+    dim.labels.map(([nm,code,col]) => {
+      allColors.push(col);
+      return `<div class="row"><span class="dot" style="background:${col};color:${col}"></span>`+
+             `<span class="nm">${nm}</span><span class="code">${code}</span></div>`;
+    }).join('');
+  grid.appendChild(el);
+}
+
+// little mock scatter so the palette is visible as dots on the atlas background
+const cv = document.getElementById('mock'), cx = cv.getContext('2d');
+let seed = 7; const rnd = () => (seed = (seed*1103515245+12345)&0x7fffffff)/0x7fffffff;
+for (let i=0;i<3500;i++){
+  const c = allColors[Math.floor(rnd()*allColors.length)];
+  cx.globalAlpha = 0.75; cx.fillStyle = c;
+  cx.beginPath(); cx.arc(rnd()*cv.width, rnd()*cv.height, 1.6, 0, 6.283); cx.fill();
+}
+</script>
+</body>
+</html>

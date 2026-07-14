@@ -1,0 +1,11 @@
+# generated data artifacts (large — never commit)
+*.f32
+*.npy
+*.jsonl
+*.ids.json
+*.shape.json
+web/data/
+# logs, caches, backups
+*.log
+__pycache__/
+*.bak

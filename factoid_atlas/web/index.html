@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BELLADONNA — Factoid Atlas</title>
+<link rel="stylesheet" href="style.css?v=6">
+</head>
+<body>
+  <div id="loader">loading factoid atlas…</div>
+
+  <header>
+    <div class="brand">BELLADONNA <span>· Factoid Atlas</span></div>
+    <div id="stat" class="stat"></div>
+    <button id="meth-btn" class="ghost">about</button>
+  </header>
+
+  <aside id="sidebar">
+    <section>
+      <div class="lbl">Colour by</div>
+      <div id="mode" class="modes"></div>
+    </section>
+
+    <section>
+      <div class="lbl-row"><span class="lbl">Categories</span>
+        <span class="mini"><button id="cat-all">all</button><button id="cat-none">none</button></span>
+      </div>
+      <label class="hide-none"><input type="checkbox" id="show-labels" checked> labels on chart</label>
+      <label class="hide-none"><input type="checkbox" id="hide-none" checked> hide “none / background”</label>
+      <div id="legend" class="legend"></div>
+    </section>
+
+    <section id="src-block">
+      <div class="lbl-row"><span class="lbl">Sources</span>
+        <span class="mini"><button id="src-all">all</button><button id="src-none">none</button></span>
+      </div>
+      <div id="src-list" class="legend"></div>
+    </section>
+
+    <section id="xfilter-block">
+      <div class="lbl-row"><span class="lbl">Refine</span>
+        <span class="mini"><button id="xf-clear">clear</button></span>
+      </div>
+      <div class="mini" style="opacity:.6;margin-bottom:4px">pick categories → chips appear bottom-right; toggle AND/OR between them</div>
+      <div id="xfilter" class="legend"></div>
+    </section>
+
+    <section>
+      <div class="lbl-row"><span class="lbl">Year</span><span id="yr-lbl" class="mini"></span></div>
+      <div class="yr"><input type="range" id="yr-min"><input type="range" id="yr-max"></div>
+    </section>
+
+    <section>
+      <div class="lbl">Search factoid text</div>
+      <input type="text" id="search" placeholder="e.g. HER2, olaparib, pCR…">
+      <div id="search-hint" class="mini"></div>
+    </section>
+
+    <section class="sliders">
+      <label>dot <input type="range" id="psize" min="1" max="5" step="1" value="2"></label>
+      <label>opacity <input type="range" id="alpha" min="0.2" max="1" step="0.05" value="0.8"></label>
+      <button id="reset" class="ghost wide">reset view</button>
+    </section>
+  </aside>
+
+  <main>
+    <canvas id="canvas"></canvas>
+    <div id="legend-float"></div>
+    <div id="tt" class="tt"></div>
+    <div id="info" class="info"></div>
+    <div id="querybar"></div>
+  </main>
+
+  <div id="details" hidden>
+    <button id="det-close">×</button>
+    <div id="det-body"></div>
+  </div>
+
+  <div id="meth" data-open="0">
+    <div class="meth-card">
+      <button id="meth-close">×</button>
+      <h2>Factoid Atlas</h2>
+      <p>Every dot is one <b>factoid</b> — a single self-contained clinical statement extracted from
+      breast-cancer guidelines, trials, regulatory labels and the literature. Position comes from a UMAP
+      projection of the factoid's <code>Qwen3-Embedding-8B</code> vector, so semantically similar factoids
+      sit together.</p>
+      <p>The default <b>All (combined)</b> view shows every point at once, coloured by its
+      single most-specific categorisation across three axes — <b style="color:#e04b59">drug class (reds)</b>,
+      <b style="color:#3a86ff">biomarker / molecular (blues)</b> and
+      <b style="color:#52b788">disease setting (greens)</b> — with the shade indicating the specific
+      category. Grey is the faint background of factoids that aren't specific on any axis. Each label is
+      assigned per factoid by <code>GPT-OSS-120B</code>. Switch <b>Colour by</b> to view any single axis on its own.</p>
+      <p class="dim">Inspired by the concept-atlas figure in Apollo (Mahmood lab). Prototype build.</p>
+    </div>
+  </div>
+
+  <script src="app.js?v=12"></script>
+</body>
+</html>
