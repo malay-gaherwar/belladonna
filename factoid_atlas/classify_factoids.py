@@ -58,7 +58,7 @@ LLM_TIMEOUT_SECONDS = 180
 # budget must cover that reasoning PLUS the JSON answer (~30 tokens/factoid),
 # or the answer is truncated to empty. Budget = overhead + per-factoid output.
 REASONING_OVERHEAD_TOKENS = 1800
-OUTPUT_TOKENS_PER_FACTOID = 90
+OUTPUT_TOKENS_PER_FACTOID = 200   # v2 schema: 7 fields incl. an agent LIST (was 3 fields @90)
 MAX_TEXT_CHARS = 600                      # truncate very long factoids for the prompt
 
 
@@ -73,24 +73,100 @@ def _dimension_block(dim: str) -> str:
     return "\n".join(lines)
 
 
+def _name_of(dim: str, code: str) -> str:
+    for e in tax.TAXONOMY[dim]:
+        if e["code"] == code:
+            return e["name"]
+    return code
+
+
+def _agent_block() -> str:
+    """drug_agent LIST, grouped by parent class/subclass (mirrors the spec)."""
+    groups: list = []
+    order: dict = {}
+    for code, name, cls, sub in tax.AGENT_META:
+        label = _name_of("drug_class", cls) + (f" — {_name_of('drug_subclass', sub)}" if sub else "")
+        if label not in order:
+            order[label] = len(groups)
+            groups.append((label, []))
+        groups[order[label]][1].append(f"  - {code}: {name}")
+    out = ["drug_agent (LIST — include EVERY agent listed below that the factoid refers to,",
+           "even if it is not the main focus; leave empty [] if none applies):"]
+    for label, items in groups:
+        out.append("")
+        out.append(f"  {label}:")
+        out.extend(items)
+    return "\n".join(out)
+
+
 SYSTEM_PROMPT = (
     "You are a breast-oncology expert annotator. You label short factual "
     "statements ('factoids') extracted from breast-cancer guidelines, trials, "
     "regulatory labels and the literature.\n\n"
-    "For EACH factoid, assign exactly ONE code from EACH of the four dimensions "
-    "below. Choose the single best fit. If a dimension does not clearly apply, "
-    "use the dimension's default code ('none' for drug_class/biomarker/setting, "
-    "'background_def' for evidence). Pick the code that reflects the factoid's "
-    "main clinical focus, not every entity it mentions.\n\n"
+    "For EACH factoid, assign one code from each dimension below. drug_agent takes "
+    "a LIST (may be empty, may contain several codes). drug_subclass and "
+    "drug_agent_primary may be null. Choose the single best fit. If a dimension does "
+    "not clearly apply, use its default ('none' for drug_class / biomarker / setting, "
+    "'background_def' for evidence, [] for drug_agent, null for drug_subclass and "
+    "drug_agent_primary). Pick the code that reflects the factoid's main clinical "
+    "focus, not every entity it mentions.\n\n"
+    "The focus of this annotation is clinical. Preclinical and mechanistic statements "
+    "are captured through the evidence dimension, but drug_class / biomarker / setting "
+    "still describe the clinical concept the factoid is about.\n\n"
     "DIMENSIONS AND ALLOWED CODES:\n\n"
-    + "\n\n".join(_dimension_block(d) for d in tax.DIMENSIONS)
-    + "\n\n"
-    "OUTPUT FORMAT: Return ONLY a JSON array, no prose, no markdown fences. "
-    "One object per factoid, IN THE SAME ORDER as given, each of the form:\n"
-    + '{"i": <index>, '
-    + ", ".join(f'"{d}": "<code>"' for d in tax.DIMENSIONS)
-    + "}\n"
-    "Use only the codes listed above (the part before the colon)."
+    + _dimension_block("drug_class") + "\n\n"
+    + "drug_subclass:\n"
+      "  The therapeutic subgroup the factoid refers to, or null if none applies.\n"
+      "  Assign it also when the factoid refers to the subgroup generically without\n"
+      "  naming a substance (e.g. \"oral SERDs are an option after progression\",\n"
+      "  \"Trop-2-directed ADCs\").\n"
+    + "\n".join(f"  - {e['code']}: {e['desc']}"
+                for e in tax.TAXONOMY["drug_subclass"] if e["code"] != "none")
+    + "\n\n" + _agent_block() + "\n\n"
+      "  Rules for drug_agent:\n"
+      "  - Use ONLY the agent codes listed above. Any other drug receives a\n"
+      "    drug_class code and an empty drug_agent list.\n"
+      "  - Match brand names, INN and development codes to the same agent code\n"
+      "    (e.g. Enhertu/DS-8201 -> t_dxd; Ibrance/PD-0332991 -> palbociclib).\n"
+      "  - CRITICAL: 'trastuzumab' refers ONLY to the naked antibody. Do NOT assign\n"
+      "    trastuzumab when the factoid refers to trastuzumab deruxtecan or\n"
+      "    trastuzumab emtansine — use t_dxd / t_dm1 instead. Assign both trastuzumab\n"
+      "    and pertuzumab for the fixed-dose combination (Phesgo).\n"
+      "  - Include an agent when the factoid negates it or advises against it (the\n"
+      "    drug is still the subject). Do NOT include agents that are merely named as\n"
+      "    unrelated background.\n\n"
+      "drug_agent_primary:\n"
+      "  The single agent from drug_agent the factoid is mainly about, or null if\n"
+      "  drug_agent is empty. If several agents are compared, choose the one whose\n"
+      "  effect or use the factoid is primarily reporting (e.g. for 'T-DXd improved\n"
+      "  PFS versus T-DM1', the primary agent is t_dxd). Must be one of the codes in\n"
+      "  drug_agent.\n\n"
+      "  Consistency: if drug_agent is non-empty, drug_class MUST be the class that\n"
+      "  drug_agent_primary belongs to, and drug_subclass MUST be the subgroup that\n"
+      "  drug_agent_primary belongs to (where a subgroup exists for that class).\n\n"
+    + _dimension_block("biomarker") + "\n"
+      "\n  HER2 category priority: her2_pos > her2_ultralow > her2_low > her2_neg.\n"
+      "  Use the most specific HER2 category the factoid supports; fall back to\n"
+      "  her2_neg only when no finer category applies. Note that HER2-low and\n"
+      "  HER2-ultralow are subsets of HER2-negative disease — do NOT use her2_neg\n"
+      "  for factoids that specify HER2-low or HER2-ultralow.\n"
+      "  If a factoid centers on triple-negative disease, use tnbc rather than\n"
+      "  her2_neg. If it centers on HR+/luminal disease without a specific HER2\n"
+      "  focus, use hr_pos.\n"
+      "  Apply these codes both when the factoid states IHC/ISH criteria explicitly\n"
+      "  and when it uses the corresponding terminology without criteria.\n"
+      "  Classify retrospectively: apply current definitions regardless of\n"
+      "  publication year. A pre-2022 factoid describing IHC 1+ is her2_low, even\n"
+      "  though the term did not exist at the time.\n\n"
+    + _dimension_block("setting") + "\n\n"
+    + _dimension_block("evidence") + "\n"
+      "\n  If a factoid reports both preclinical and clinical findings, use clinical.\n\n"
+      "OUTPUT FORMAT: Return ONLY a JSON array, no prose, no markdown fences. One\n"
+      "object per factoid, IN THE SAME ORDER as given, each of the form:\n"
+      '{"i": <index>, "drug_class": "<code>", "drug_subclass": "<code>" | null,\n'
+      ' "drug_agent": ["<code>", ...], "drug_agent_primary": "<code>" | null,\n'
+      ' "biomarker": "<code>", "setting": "<code>", "evidence": "<code>"}\n'
+      "Use only the codes listed above (the part before the colon)."
 )
 
 
@@ -114,15 +190,37 @@ _DEFAULT = {d: tax.default_code(d) for d in tax.DIMENSIONS}
 _VALID = {d: tax.valid_codes(d) for d in tax.DIMENSIONS}
 
 
-def _coerce(obj: dict) -> Dict[str, str]:
-    out: Dict[str, str] = {}
+def _coerce(obj: dict) -> Dict[str, object]:
+    """Validate one label object. Unknown/null codes fall back to the index-0
+    default. drug_agent is a LIST; drug_class/drug_subclass are then forced to
+    agree with drug_agent_primary (the spec's consistency rule)."""
+    out: Dict[str, object] = {}
     for d in tax.DIMENSIONS:
         code = obj.get(d)
         out[d] = code if (isinstance(code, str) and code in _VALID[d]) else _DEFAULT[d]
+
+    raw = obj.get("drug_agent")
+    agents: List[str] = []
+    if isinstance(raw, list):
+        for a in raw:
+            if isinstance(a, str) and a in tax.AGENT_CODES and a not in agents:
+                agents.append(a)
+
+    prim = out["drug_agent_primary"]
+    if not agents:
+        prim = "none"
+    elif prim == "none" or prim not in agents:
+        prim = agents[0]          # model omitted/mismatched primary -> first agent
+    if prim != "none":            # consistency: class + subclass follow the agent
+        out["drug_class"] = tax.AGENT_TO_CLASS[prim]
+        out["drug_subclass"] = tax.AGENT_TO_SUBCLASS[prim]
+
+    out["drug_agent"] = agents
+    out["drug_agent_primary"] = prim
     return out
 
 
-def parse_response(text: str, batch_size: int) -> Optional[List[Dict[str, str]]]:
+def parse_response(text: str, batch_size: int) -> Optional[List[Dict[str, object]]]:
     """Parse the model's JSON array into batch_size label dicts, aligned by 'i'.
     Returns None if nothing parseable (caller retries)."""
     m = _JSON_ARRAY_RE.search(text or "")
@@ -146,7 +244,7 @@ def parse_response(text: str, batch_size: int) -> Optional[List[Dict[str, str]]]
             idx = k
         by_idx[idx] = item
 
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, object]] = []
     for i in range(batch_size):
         out.append(_coerce(by_idx.get(i, {})))
     return out
@@ -156,7 +254,7 @@ def parse_response(text: str, batch_size: int) -> Optional[List[Dict[str, str]]]
 # LLM call
 # ---------------------------------------------------------------------------
 
-async def classify_batch(client, sem, batch: List[dict]) -> List[Dict[str, str]]:
+async def classify_batch(client, sem, batch: List[dict]) -> List[Dict[str, object]]:
     user = build_user_prompt(batch)
     max_tokens = REASONING_OVERHEAD_TOKENS + OUTPUT_TOKENS_PER_FACTOID * len(batch)
     last_err: Optional[Exception] = None

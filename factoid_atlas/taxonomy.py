@@ -31,13 +31,16 @@ from typing import Dict, List
 
 # Active color dimensions. Evidence/theme + Endpoint/outcome are defined below
 # but intentionally left OUT of DIMENSIONS for now (re-add the keys to enable).
-DIMENSIONS = ["drug_class", "biomarker", "setting"]
+DIMENSIONS = ["drug_class", "drug_subclass", "drug_agent_primary",
+              "biomarker", "setting", "evidence"]
 
 DIM_TITLES = {
     "drug_class": "Drug class",
+    "drug_subclass": "Drug subclass",
+    "drug_agent_primary": "Drug (agent)",
     "biomarker": "Biomarker / molecular",
     "setting": "Disease setting",
-    "evidence": "Evidence / theme",
+    "evidence": "Evidence type",
     "endpoint": "Endpoint / outcome",
 }
 
@@ -52,11 +55,11 @@ TAXONOMY: Dict[str, List[dict]] = {
         {"code": "none",           "name": "No drug / not drug-specific", "color": GREY,
          "desc": "Factoid does not center on a specific drug or drug class."},
         {"code": "endocrine",      "name": "Endocrine therapy",           "color": "#2a9d8f",
-         "desc": "Aromatase inhibitors, tamoxifen, fulvestrant, oral SERDs, GnRH agonists, progestins."},
+         "desc": "Aromatase inhibitors, tamoxifen, fulvestrant, oral SERDs, injectable SERDs, GnRH agonists."},
         {"code": "cdk46",          "name": "CDK4/6 inhibitor",            "color": "#e8177f",
          "desc": "Palbociclib, ribociclib, abemaciclib."},
         {"code": "pi3k",           "name": "PI3K / AKT / PTEN inhibitor",  "color": "#9b5de5",
-         "desc": "Alpelisib, capivasertib, everolimus."},
+         "desc": "Alpelisib, inavolisib, capivasertib, everolimus."},
         {"code": "parp",           "name": "PARP inhibitor",              "color": "#5161d6",
          "desc": "Olaparib, talazoparib."},
         {"code": "her2_mab",       "name": "Anti-HER2 antibody",          "color": "#3a86ff",
@@ -86,11 +89,14 @@ TAXONOMY: Dict[str, List[dict]] = {
         {"code": "none",          "name": "No specific biomarker",       "color": GREY,
          "desc": "No biomarker mentioned / not biomarker-specific."},
         {"code": "her2_pos",      "name": "HER2-positive",               "color": "#1d4ed8",
-         "desc": "HER2-positive: IHC 3+ or ISH-positive."},
+         "desc": "HER2-positive: IHC 3+, or IHC 2+ with ISH-positive."},
         {"code": "her2_low",      "name": "HER2-low",                    "color": "#3a86ff",
-         "desc": "HER2-low: IHC 1+ or IHC 2+/ISH-negative."},
+         "desc": "HER2-low: IHC 1+, or IHC 2+ with ISH-negative."},
         {"code": "her2_ultralow", "name": "HER2-ultralow",               "color": "#90caf9",
-         "desc": "HER2-ultralow: very low HER2 expression below the HER2-low threshold."},
+         "desc": "HER2-ultralow: IHC 0 with faint/incomplete membrane staining in <=10% of tumour cells."},
+        {"code": "her2_neg",      "name": "HER2-negative",               "color": "#b8c6db",
+         "desc": "HER2-negative without a more specific HER2 category: IHC 0 with no staining, or the factoid "
+                 "states HER2-negative / HER2-non-amplified without specifying IHC/ISH."},
         {"code": "hr_pos",        "name": "HR+ / ER+ / luminal",         "color": "#2a9d8f",
          "desc": "ER-positive and/or PR-positive, luminal subtypes."},
         {"code": "tnbc",          "name": "Triple-negative (TNBC)",      "color": "#e63946",
@@ -151,7 +157,7 @@ TAXONOMY: Dict[str, List[dict]] = {
          "desc": "Side-effect / toxicity management, supportive care."},
         {"code": "palliative",      "name": "Palliative care",           "color": "#ffb4a2",
          "desc": "Palliative and end-of-life care."},
-        {"code": "ibc",             "name": "Inflammatory BC",           "color": "#c1121f",
+        {"code": "inflamm_bc",      "name": "Inflammatory BC",           "color": "#c1121f",
          "desc": "Inflammatory breast cancer-specific staging, treatment, guidelines."},
         {"code": "pregnancy_young",  "name": "Pregnancy / young women",  "color": "#9b5de5",
          "desc": "Breast cancer in pregnancy, fertility preservation, young patients."},
@@ -164,29 +170,19 @@ TAXONOMY: Dict[str, List[dict]] = {
     # -------------------------------------------------------------------
     # 4. EVIDENCE / THEME
     # -------------------------------------------------------------------
+    # NOTE: replaced (v2). The previous 11-code "evidence / theme" vocabulary
+    # (rct / meta_sr / guideline / regulatory / ...) is superseded by the 3-code
+    # clinical-vs-preclinical spec. Index 0 = background_def == the spec default.
     "evidence": [
-        {"code": "unclear",           "name": "Not evidence-specific",    "color": GREY,
-         "desc": "Not evidence-specific or unclear."},
-        {"code": "definition",        "name": "Definition / classification","color": "#8d99ae",
-         "desc": "Definitions, disease classification, descriptive background statements."},
-        {"code": "mechanism",         "name": "Mechanism / biology",      "color": "#9b5de5",
-         "desc": "Mechanism of action, molecular pathways, preclinical and translational science."},
-        {"code": "epidemiology",      "name": "Epidemiology / prognosis", "color": "#52b788",
-         "desc": "Incidence, risk factors, prognostic statements, population-level survival statistics."},
-        {"code": "rct",               "name": "RCT result",               "color": "#3a86ff",
-         "desc": "Result or design of a randomized controlled trial."},
-        {"code": "meta_sr",           "name": "Meta-analysis / SR",       "color": "#5161d6",
-         "desc": "Meta-analysis or systematic review."},
-        {"code": "observational",     "name": "Real-world / observational","color": "#ffd166",
-         "desc": "Registry, cohort, case-control, real-world evidence."},
-        {"code": "guideline",         "name": "Guideline recommendation", "color": "#2a9d8f",
-         "desc": "Recommendation or level-of-evidence statement from AGO, ESMO, ASCO, etc."},
-        {"code": "regulatory",        "name": "Regulatory / label",       "color": "#f4a261",
-         "desc": "Regulatory approval, indication, or drug-label statement (FDA/EMA)."},
-        {"code": "diagnostic_method", "name": "Diagnostic method",        "color": "#00b4d8",
-         "desc": "Diagnostic-test performance, assay validity, imaging methodology, biomarker validation."},
-        {"code": "safety_qol",        "name": "Safety / QoL",             "color": "#e63946",
-         "desc": "Adverse events, toxicity, safety profile, patient-reported outcomes."},
+        {"code": "background_def",    "name": "Background / definition",  "color": GREY,
+         "desc": "Definition, classification, epidemiology or background knowledge stated without "
+                 "reference to a specific study or experiment."},
+        {"code": "clinical",          "name": "Clinical",                 "color": "#3a86ff",
+         "desc": "Statement about humans, including clinical trials (any phase), patient cohorts, "
+                 "registries, case series, guideline recommendations, regulatory decisions and product labels."},
+        {"code": "preclinical",       "name": "Preclinical",              "color": "#9b5de5",
+         "desc": "In vitro, cell line, organoid, xenograft or animal work; mechanistic experiments "
+                 "not conducted in patients."},
     ],
 
     # -------------------------------------------------------------------
@@ -219,6 +215,103 @@ TAXONOMY: Dict[str, List[dict]] = {
          "desc": "Regulatory approval / indication as the outcome."},
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# v2 additions: drug subclass + individual agents
+# ---------------------------------------------------------------------------
+# The classifier also emits `drug_agent` as a LIST (every listed agent the
+# factoid refers to). A list cannot live in the fixed-width attrs.bin record,
+# so only `drug_agent_primary` becomes an atlas dimension; the full list is
+# preserved per-factoid in the labels JSONL.
+
+def _shade(hex_color: str, factor: float) -> str:
+    """Blend a hex colour toward white (0 = unchanged, 1 = white)."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    r = int(r + (255 - r) * factor)
+    g = int(g + (255 - g) * factor)
+    b = int(b + (255 - b) * factor)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+_CLASS_COLOR = {e["code"]: e["color"] for e in TAXONOMY["drug_class"]}
+_ENDO, _ADC = _CLASS_COLOR["endocrine"], _CLASS_COLOR["adc"]
+
+TAXONOMY["drug_subclass"] = [
+    {"code": "none",      "name": "No subclass",              "color": GREY,
+     "desc": "No drug subgroup applies."},
+    {"code": "ai",        "name": "Aromatase inhibitor",      "color": _shade(_ENDO, 0.00),
+     "desc": "Aromatase inhibitors (within endocrine)."},
+    {"code": "serm",      "name": "SERM",                     "color": _shade(_ENDO, 0.15),
+     "desc": "Selective estrogen receptor modulators (within endocrine)."},
+    {"code": "serd_inj",  "name": "SERD (injectable)",        "color": _shade(_ENDO, 0.30),
+     "desc": "Injectable selective estrogen receptor degraders (within endocrine)."},
+    {"code": "serd_oral", "name": "SERD (oral)",              "color": _shade(_ENDO, 0.45),
+     "desc": "Oral selective estrogen receptor degraders (within endocrine)."},
+    {"code": "ofs",       "name": "Ovarian suppression",      "color": _shade(_ENDO, 0.60),
+     "desc": "Ovarian function suppression / GnRH agonists (within endocrine)."},
+    {"code": "adc_her2",  "name": "ADC (HER2-directed)",      "color": _shade(_ADC, 0.00),
+     "desc": "HER2-directed antibody-drug conjugates (within ADC)."},
+    {"code": "adc_trop2", "name": "ADC (Trop-2-directed)",    "color": _shade(_ADC, 0.30),
+     "desc": "Trop-2-directed antibody-drug conjugates (within ADC)."},
+]
+
+# (agent code, display name, parent drug_class, parent drug_subclass or None)
+AGENT_META = [
+    ("t_dxd",         "Trastuzumab deruxtecan (T-DXd)", "adc",       "adc_her2"),
+    ("t_dm1",         "Trastuzumab emtansine (T-DM1)",  "adc",       "adc_her2"),
+    ("sg",            "Sacituzumab govitecan",          "adc",       "adc_trop2"),
+    ("dato_dxd",      "Datopotamab deruxtecan",         "adc",       "adc_trop2"),
+    ("trastuzumab",   "Trastuzumab",                    "her2_mab",  None),
+    ("pertuzumab",    "Pertuzumab",                     "her2_mab",  None),
+    ("margetuximab",  "Margetuximab",                   "her2_mab",  None),
+    ("tucatinib",     "Tucatinib",                      "her2_tki",  None),
+    ("neratinib",     "Neratinib",                      "her2_tki",  None),
+    ("lapatinib",     "Lapatinib",                      "her2_tki",  None),
+    ("letrozole",     "Letrozole",                      "endocrine", "ai"),
+    ("anastrozole",   "Anastrozole",                    "endocrine", "ai"),
+    ("exemestane",    "Exemestane",                     "endocrine", "ai"),
+    ("tamoxifen",     "Tamoxifen",                      "endocrine", "serm"),
+    ("toremifene",    "Toremifene",                     "endocrine", "serm"),
+    ("fulvestrant",   "Fulvestrant",                    "endocrine", "serd_inj"),
+    ("elacestrant",   "Elacestrant",                    "endocrine", "serd_oral"),
+    ("camizestrant",  "Camizestrant",                   "endocrine", "serd_oral"),
+    ("giredestrant",  "Giredestrant",                   "endocrine", "serd_oral"),
+    ("imlunestrant",  "Imlunestrant",                   "endocrine", "serd_oral"),
+    ("goserelin",     "Goserelin",                      "endocrine", "ofs"),
+    ("leuprorelin",   "Leuprorelin",                    "endocrine", "ofs"),
+    ("triptorelin",   "Triptorelin",                    "endocrine", "ofs"),
+    ("palbociclib",   "Palbociclib",                    "cdk46",     None),
+    ("ribociclib",    "Ribociclib",                     "cdk46",     None),
+    ("abemaciclib",   "Abemaciclib",                    "cdk46",     None),
+    ("olaparib",      "Olaparib",                       "parp",      None),
+    ("talazoparib",   "Talazoparib",                    "parp",      None),
+    ("alpelisib",     "Alpelisib",                      "pi3k",      None),
+    ("inavolisib",    "Inavolisib",                     "pi3k",      None),
+    ("capivasertib",  "Capivasertib",                   "pi3k",      None),
+    ("everolimus",    "Everolimus",                     "pi3k",      None),
+    ("pembrolizumab", "Pembrolizumab",                  "immuno",    None),
+    ("atezolizumab",  "Atezolizumab",                   "immuno",    None),
+    ("durvalumab",    "Durvalumab",                     "immuno",    None),
+]
+
+_seen: Dict[str, int] = {}
+_agents = [{"code": "none", "name": "No specific agent", "color": GREY,
+            "desc": "Factoid does not refer to any of the listed agents."}]
+for _c, _n, _cls, _sub in AGENT_META:
+    _i = _seen.get(_cls, 0)
+    _seen[_cls] = _i + 1
+    _agents.append({
+        "code": _c, "name": _n,
+        "color": _shade(_CLASS_COLOR.get(_cls, "#8d99ae"), min(0.55, 0.11 * _i)),
+        "desc": f"{_n} — {_cls}" + (f" / {_sub}" if _sub else ""),
+    })
+TAXONOMY["drug_agent_primary"] = _agents
+
+AGENT_CODES = {c for c, _, _, _ in AGENT_META}
+AGENT_TO_CLASS = {c: cls for c, _, cls, _ in AGENT_META}
+AGENT_TO_SUBCLASS = {c: (sub or "none") for c, _, _, sub in AGENT_META}
 
 
 # ---------------------------------------------------------------------------

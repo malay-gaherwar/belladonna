@@ -188,7 +188,9 @@ function passes(i){
     if(!acc) return false; }
   const m=mode();
   if(m.kind==='dim'||m.kind==='cluster'){ if(!S.activeCat.has(m.values[i])) return false; }
-  if(m.kind==='combined'){ const dd=S.domDim[i]; if(dd>0 && !S.famActive.has(dd)) return false; }
+  if(m.kind==='dim' && S.hideNone && m.values[i]===0) return false;
+  if(m.kind==='combined'){ const dd=S.domDim[i]; if(dd>0 && !S.famActive.has(dd)) return false;
+    if(dd===0 && S.hideNone) return false; }
   return true;
 }
 
