@@ -1,127 +1,180 @@
+#!/usr/bin/env python3
+
 import os
 import json
 import spacy
 from pathlib import Path
+from bs4 import BeautifulSoup
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+INPUT_DIR = "artifacts/epmc_fulltext/xml"
+OUTPUT_DIR = "artifacts/epmc_fulltext/ner"
+MAX_FILES = 2  # set None for all files
 
 # -------------------------
 # LOAD MODELS
 # -------------------------
 
-# Sentence splitter (unchanged)
-nlp = spacy.load("en_core_web_sm")
+print("[INFO] Loading models...")
 
-# Biomedical NER model
-try:
-    ner_nlp = spacy.load("en_ner_bc5cdr_md")
-except Exception as e:
-    raise RuntimeError(
-        "Could not load SciSpaCy model 'en_ner_bc5cdr_md'. "
-        "Install with: pip install en_ner_bc5cdr_md-0.5.4.tar.gz\n"
-        f"Error: {e}"
-    )
+ner_nlp = spacy.load("en_ner_bc5cdr_md")
+
+print("[INFO] Models loaded")
 
 
 # ============================================================
-# ORIGINAL FUNCTIONS — KEEP UNCHANGED
+# METADATA EXTRACTION
 # ============================================================
 
-def split_into_sentences(text: str):
-    doc = nlp(text)
-    sentences = []
-    for i, sent in enumerate(doc.sents):
-        clean = sent.text.strip().replace("\n", " ")
-        if clean:
-            sentences.append({"id": i, "sentence": clean})
-    return sentences
+def extract_metadata(soup):
+    def get_text(tag):
+        return tag.get_text(strip=True) if tag else None
 
-
-# ============================================================
-# NER + METADATA EXTRACTION
-# ============================================================
-
-def perform_ner_on_sentences(sentences):
-    out = []
-    for s in sentences:
-        doc = ner_nlp(s["sentence"])
-        ents = [{"text": ent.text, "label": ent.label_} for ent in doc.ents]
-        out.append({
-            "id": s["id"],
-            "sentence": s["sentence"],
-            "entities": ents
-        })
-    return out
-
-
-def extract_metadata(text: str):
     metadata = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("---"):
-            break
-        if ":" in line:
-            key, val = line.split(":", 1)
-            metadata[key.strip()] = val.strip()
+
+    metadata["TITLE"] = get_text(soup.find("article-title"))
+    metadata["PMCID"] = get_text(soup.find("article-id", {"pub-id-type": "pmcid"}))
+    metadata["DOI"] = get_text(soup.find("article-id", {"pub-id-type": "doi"}))
+    metadata["JOURNAL"] = get_text(soup.find("journal-title"))
+
+    # PMID fallback
+    pmid = soup.find("article-id", {"pub-id-type": "pmid"})
+    if pmid:
+        metadata["ID"] = f"MED:{pmid.get_text(strip=True)}"
+
+    # Year
+    pub_date = soup.find("pub-date", {"pub-type": "epub"})
+    if pub_date:
+        year = pub_date.find("year")
+        if year:
+            metadata["YEAR"] = year.get_text(strip=True)
+
+    # Authors
+    authors = []
+    for contrib in soup.find_all("contrib", {"contrib-type": "author"}):
+        surname = contrib.find("surname")
+        given = contrib.find("given-names")
+        if surname and given:
+            authors.append(f"{surname.get_text()} {given.get_text()}")
+
+    metadata["AUTHORS"] = ", ".join(authors) if authors else None
+
+    # Static fields
+    metadata["document_type"] = "Article"
+    metadata["source_family"] = "EPMC Full text"
+
     return metadata
 
 
-def process_file_with_ner(input_path: str, output_dir="artifacts/ner"):
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+# ============================================================
+# FULL TEXT EXTRACTION (BROAD + ROBUST)
+# ============================================================
 
-    filename = os.path.basename(input_path)
-    base = filename.replace(".txt", "")
+def extract_full_text(soup):
+    paragraphs = []
+    last_section = None
 
-    # Load entire file
-    with open(input_path, "r", encoding="utf-8") as f:
-        full_text = f.read()
-
-    # ---- Extract metadata (unchanged) ----
-    metadata = extract_metadata(full_text)
-
-    # ---- Extract ONLY body text AFTER dashed line (compact version) ----
-    lines = full_text.splitlines()
-    body_lines = []
-    seen_separator = False
-    for line in lines:
-        if line.strip().startswith("---"):
-            seen_separator = True
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if not text:
             continue
-        if seen_separator:
-            body_lines.append(line)
-    body = "\n".join(body_lines)
 
-    # ---- Sentence splitting ----
-    sentences = split_into_sentences(body)
+        # find nearest section
+        section = p.find_parent("sec")
+        section_title = None
 
-    # ---- NER ----
-    ner_sentences = perform_ner_on_sentences(sentences)
+        if section:
+            title_tag = section.find("title")
+            if title_tag:
+                section_title = title_tag.get_text(" ", strip=True)
 
-    # ---- Final JSON output ----
-    out_json = {
-        "metadata": metadata,
-        "sentences": ner_sentences
-    }
+        # add section title only when it changes
+        if section_title and section_title != last_section:
+            text = f"{section_title} {text}"
+            last_section = section_title
 
-    out_path = os.path.join(output_dir, f"{base}_ner.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out_json, f, indent=2)
+        paragraphs.append(text)
 
-    print(f"[OK] {filename}: {len(sentences)} sentences processed")
-    print(f"→ Output saved to {out_path}")
+    return "\n".join(paragraphs)
+# ============================================================
+# NER (CHUNKED FOR PERFORMANCE)
+# ============================================================
+
+def perform_ner(full_text, chunk_size=5000):
+    entities = []
+
+    for i in range(0, len(full_text), chunk_size):
+        chunk = full_text[i:i + chunk_size]
+
+        doc = ner_nlp(chunk)
+
+        for ent in doc.ents:
+            entities.append({
+                "text": ent.text,
+                "label": ent.label_
+            })
+
+    return entities
 
 
 # ============================================================
-# MAIN — MINIMAL AND CLEAN
+# PIPELINE
+# ============================================================
+
+def process_xml(file_path):
+    filename = os.path.basename(file_path)
+    base = filename.replace(".xml", "")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f, "xml")
+
+    metadata = extract_metadata(soup)
+    full_text = extract_full_text(soup)
+
+    print(f"[INFO] {filename} → {len(full_text)} characters")
+
+    entities = perform_ner(full_text)
+
+    output = {
+        "metadata": metadata,
+        "full_text": full_text,
+        "entities": entities
+    }
+
+    out_path = os.path.join(OUTPUT_DIR, f"{base}_ner.json")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+
+    print(f"[OK] Saved → {out_path}")
+    print(f"[NER] {len(entities)} entities extracted")
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
-    input_dir = "artifacts/epmc_fulltext"
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    for filename in os.listdir(input_dir):
-        if filename.endswith(".txt"):
-            input_path = os.path.join(input_dir, filename)
-            print(f"\n[PROCESSING] {filename}")
-            process_file_with_ner(input_path)
+    count = 0
 
+    for filename in os.listdir(INPUT_DIR):
+        if not filename.endswith(".xml"):
+            continue
+
+        file_path = os.path.join(INPUT_DIR, filename)
+
+        print(f"\n[PROCESSING] {filename}")
+
+        process_xml(file_path)
+
+        count += 1
+        if MAX_FILES and count >= MAX_FILES:
+            break
 
 
 if __name__ == "__main__":

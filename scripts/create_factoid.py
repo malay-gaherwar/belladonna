@@ -1,8 +1,6 @@
 import os
 import json
-import asyncio
-from typing import Any, Dict
-from openai import AsyncOpenAI
+from openai import OpenAI
 
 # --------------------------
 # CONFIG
@@ -12,7 +10,7 @@ CONFIG = {
     "API": {
         "BASE_URL": os.environ.get("BASE_URL"),
         "API_KEY": os.environ.get("VIRTUAL_API_KEY"),
-        "Model": "GPT-OSS-120B",
+        "Model": "Qwen3-Embedding-8B",
     },
     "GENERATION": {
         "temperature": 1.0,
@@ -20,10 +18,6 @@ CONFIG = {
         "max_tokens": 7000,
     },
 }
-
-MAX_CONCURRENCY = 200          # run 200 at a time
-RETRIES = 3                    # basic retry for transient failures
-RETRY_BACKOFF_BASE = 1.5       # seconds multiplier
 
 # --------------------------
 # JSON SCHEMA FOR STRUCTURED OUTPUT
@@ -104,17 +98,20 @@ Here is the input content:
 """
 
 # --------------------------
-# ASYNC OPENAI CLIENT
+# OPENAI CLIENT
 # --------------------------
 
-client = AsyncOpenAI(
+client = OpenAI(
     api_key=CONFIG["API"]["API_KEY"],
     base_url=CONFIG["API"]["BASE_URL"],
 )
 
-async def chat_create_async(messages):
-    """Structured output call for your local LLM (async)."""
-    return await client.chat.completions.create(
+print("🔧 Using API endpoint :", CONFIG["API"]["BASE_URL"])
+print("🔧 Using API key      :", "(empty)" if not CONFIG["API"]["API_KEY"] else CONFIG["API"]["API_KEY"][:8] + "...")
+
+def chat_create(messages):
+    """Structured output call for your local LLM."""
+    return client.chat.completions.create(
         model=CONFIG["API"]["Model"],
         messages=messages,
         temperature=CONFIG["GENERATION"]["temperature"],
@@ -131,14 +128,14 @@ async def chat_create_async(messages):
     )
 
 # --------------------------
-# UTIL FUNCTIONS (sync helpers)
+# UTIL FUNCTIONS
 # --------------------------
 
-def load_input(path: str) -> Dict[str, Any]:
+def load_input(path: str):
     with open(path, "r", encoding="utf8") as f:
         return json.load(f)
 
-def sentences_to_prompt_content(metadata, sentences) -> str:
+def sentences_to_prompt_content(metadata, sentences):
     md_lines = ["METADATA:"]
     for k, v in metadata.items():
         md_lines.append(f"{k}: {v}")
@@ -152,11 +149,24 @@ def sentences_to_prompt_content(metadata, sentences) -> str:
 
     return "\n".join(md_lines + sent_lines)
 
+def generate_factoids(content: str):
+    prompt = FACTOID_PROMPT.format(content=content)
+
+    response = chat_create(
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+    )
+
+    return json.loads(response.choices[0].message.content)
+
 def write_output_json(output_path: str, metadata, structured):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     doi = metadata.get("DOI", None)
 
+    # Build nested factoid objects
     factoids_list = []
     for item in structured["factoids"]:
         factoids_list.append({
@@ -175,87 +185,45 @@ def write_output_json(output_path: str, metadata, structured):
         json.dump(out, f, indent=2, ensure_ascii=False)
 
 # --------------------------
-# ASYNC FACTOID GENERATION
+# BATCH MAIN
 # --------------------------
 
-async def generate_factoids_async(content: str) -> Dict[str, Any]:
-    prompt = FACTOID_PROMPT.format(content=content)
-
-    # basic retry loop (useful for transient errors/timeouts)
-    last_err = None
-    for attempt in range(RETRIES + 1):
-        try:
-            response = await chat_create_async(
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ]
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            last_err = e
-            if attempt >= RETRIES:
-                raise
-            backoff = (RETRY_BACKOFF_BASE ** attempt)
-            await asyncio.sleep(backoff)
-
-    # should never reach here
-    raise last_err
-
-# --------------------------
-# ASYNC BATCH PROCESSING (200 at a time)
-# --------------------------
-
-async def process_one_file(filename: str, ner_folder: str, out_folder: str) -> str:
-    input_path = os.path.join(ner_folder, filename)
-    base = filename.rsplit("_ner.json", 1)[0]
-    output_path = os.path.join(out_folder, f"{base}_factoids.json")
-
-    if os.path.exists(output_path):
-        return f"[SKIP] {filename} -> already processed"
-
-    # run file IO in a thread to avoid blocking the event loop
-    data = await asyncio.to_thread(load_input, input_path)
-    metadata = data["metadata"]
-    sentences = data["sentences"]
-
-    content = sentences_to_prompt_content(metadata, sentences)
-    structured = await generate_factoids_async(content)
-
-    await asyncio.to_thread(write_output_json, output_path, metadata, structured)
-    return f"[OK] Saved: {output_path}"
-
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-async def main_async():
+def main():
     ner_folder = "artifacts/ner/"
     out_folder = "artifacts/factoids/"
     os.makedirs(out_folder, exist_ok=True)
 
     files = sorted([f for f in os.listdir(ner_folder) if f.endswith(".json")])
+
     print(f"Found {len(files)} NER files.")
 
-    # process 200 concurrently per batch
-    for batch_idx, batch_files in enumerate(chunks(files, MAX_CONCURRENCY), start=1):
-        print(f"\nBatch {batch_idx}: processing {len(batch_files)} files...")
+    for filename in files:
+        input_path = os.path.join(ner_folder, filename)
 
-        tasks = [
-            asyncio.create_task(process_one_file(fn, ner_folder, out_folder))
-            for fn in batch_files
-        ]
+        base = filename.rsplit("_ner.json", 1)[0]
+        output_path = os.path.join(out_folder, f"{base}_factoids.json")
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if os.path.exists(output_path):
+            print(f"[SKIP] {filename} -> already processed")
+            continue
 
-        # report outcomes
-        for fn, res in zip(batch_files, results):
-            if isinstance(res, Exception):
-                print(f"[ERROR] Failed processing {fn}: {res}")
-            else:
-                print(res)
+        print(f"\nProcessing {filename} ...")
+
+        try:
+            data = load_input(input_path)
+            metadata = data["metadata"]
+            sentences = data["sentences"]
+
+            content = sentences_to_prompt_content(metadata, sentences)
+            structured = generate_factoids(content)
+            write_output_json(output_path, metadata, structured)
+
+            print(f"[OK] Saved: {output_path}")
+
+        except Exception as e:
+            print(f"[ERROR] Failed processing {filename}: {e}")
 
     print("\nBatch processing complete.")
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    main()

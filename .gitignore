@@ -35,3 +35,8 @@ logs/
 elsevier_10.1016_j.annonc.2022.07.007.txt
 
 .vscode/
+# Cluster job script (machine-specific)
+run_epmc.sh
+
+# NER model (large, regenerable)
+ner_model/
